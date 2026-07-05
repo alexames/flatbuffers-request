@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-05
+
+### Added
+- `fbrequest` command-line tool (behind the `tools` vcpkg feature, or
+  `-DFBREQUEST_BUILD_TOOLS=ON`): applies a request to a FlatBuffers binary,
+  reading from a file or stdin and writing to stdout, a file, or in place.
+  See [docs/cli.md](docs/cli.md).
+- Golden-file tests exercising the CLI across all three I/O modes.
+
 ## [0.2.0] - 2026-07-05
 
 ### Changed
@@ -38,6 +47,7 @@ Initial release, extracted from the Composer engine.
 - Deleting an individual field inside a struct is a no-op (structs are
   indivisible).
 
-[Unreleased]: https://github.com/alexames/flatbuffers-request/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/alexames/flatbuffers-request/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/alexames/flatbuffers-request/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/alexames/flatbuffers-request/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/alexames/flatbuffers-request/releases/tag/v0.1.0

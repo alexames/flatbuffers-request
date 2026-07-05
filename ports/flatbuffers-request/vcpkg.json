@@ -1,6 +1,6 @@
 {
   "name": "flatbuffers-request",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Reflection-driven put/patch/delete requests for FlatBuffers binaries.",
   "homepage": "https://github.com/alexames/flatbuffers-request",
   "license": "Apache-2.0",
@@ -15,5 +15,13 @@
       "name": "vcpkg-cmake-config",
       "host": true
     }
-  ]
+  ],
+  "features": {
+    "tools": {
+      "description": "Build and install the fbrequest command-line tool.",
+      "dependencies": [
+        "cxxopts"
+      ]
+    }
+  }
 }

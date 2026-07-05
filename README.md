@@ -83,6 +83,21 @@ See [docs/grammar.md](docs/grammar.md) for the full grammar. In brief:
 
 Paths are dotted field names with `[i]` for vector indices and `.MemberName` for union members, e.g. `number.Integer.value`, `object_vector[2].name`.
 
+## Command-line tool
+
+The `tools` feature builds `fbrequest`, a Unix-style CLI that applies one request
+to a FlatBuffers binary — reading from a file or stdin, writing to stdout, a
+file, or in place:
+
+```bash
+fbrequest -s player.bfbs 'put stats.health 100' < player.bin > player2.bin
+fbrequest -s player.bfbs -i 'delete title' player.bin        # edit in place
+```
+
+It takes the binary reflection schema (`.bfbs`) as `--schema`. See
+[docs/cli.md](docs/cli.md) for the full reference. Install it via vcpkg with the
+`tools` feature, or build from source with `-DFBREQUEST_BUILD_TOOLS=ON`.
+
 ## Building from source
 
 Requires a C++23 compiler, CMake ≥ 3.21, and vcpkg (for the `flatbuffers` and `targets` dependencies).

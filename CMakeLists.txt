@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(FlatbuffersRequest
-  VERSION 0.2.0
+  VERSION 0.3.0
   DESCRIPTION "Reflection-driven put/patch/delete requests for FlatBuffers"
   HOMEPAGE_URL "https://github.com/alexames/flatbuffers-request"
   LANGUAGES CXX)
@@ -11,6 +11,7 @@ project(FlatbuffersRequest
 # ---------------------------------------------------------------------------
 option(FBREQUEST_BUILD_TESTS "Build FlatbuffersRequest tests" ${PROJECT_IS_TOP_LEVEL})
 option(FBREQUEST_BUILD_FUZZERS "Build FlatbuffersRequest fuzz targets" OFF)
+option(FBREQUEST_BUILD_TOOLS "Build the fbrequest command-line tool" ${PROJECT_IS_TOP_LEVEL})
 option(FBREQUEST_INSTALL "Generate install/export rules" ${PROJECT_IS_TOP_LEVEL})
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,24 @@ cpp_library(
 target_compile_features(FlatbuffersRequest PUBLIC cxx_std_23)
 
 # ---------------------------------------------------------------------------
+# Command-line tool
+# ---------------------------------------------------------------------------
+if(FBREQUEST_BUILD_TOOLS)
+  find_package(cxxopts CONFIG REQUIRED)
+  cpp_binary(
+      TARGET fbrequest
+      SOURCE_DIR "tools"
+      SOURCES
+          "fbrequest.cpp"
+      DEPENDENCIES
+          PRIVATE
+              FlatbuffersRequest
+              flatbuffers::flatbuffers
+              cxxopts::cxxopts
+  )
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 if(FBREQUEST_BUILD_TESTS)
@@ -103,6 +122,24 @@ if(FBREQUEST_BUILD_TESTS)
       WORKING_DIRECTORY
           "${FBREQUEST_BFBS_DIR}"
   )
+
+  # CLI golden-file tests. Each I/O mode (file, stdin, in-place) applies a
+  # fixed request to golden/input.bin and byte-compares against golden/expected.bin.
+  if(FBREQUEST_BUILD_TOOLS)
+    foreach(mode file stdin inplace)
+      add_test(
+          NAME "fbrequest_cli_golden_${mode}"
+          COMMAND "${CMAKE_COMMAND}"
+              "-DTOOL=$<TARGET_FILE:fbrequest>"
+              "-DSCHEMA=${FBREQUEST_BFBS_DIR}/test_schema.bfbs"
+              "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/test/golden/input.bin"
+              "-DREQUEST=put i8 99"
+              "-DGOLDEN=${CMAKE_CURRENT_SOURCE_DIR}/test/golden/expected.bin"
+              "-DMODE=${mode}"
+              "-DWORKDIR=${CMAKE_CURRENT_BINARY_DIR}"
+              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/run_cli_golden.cmake")
+    endforeach()
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -133,6 +170,11 @@ if(FBREQUEST_INSTALL)
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+
+  # The command-line tool (relocated to tools/<port>/ by the vcpkg portfile).
+  if(FBREQUEST_BUILD_TOOLS)
+    install(TARGETS fbrequest RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+  endif()
 
   # Hand-written public headers.
   install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"

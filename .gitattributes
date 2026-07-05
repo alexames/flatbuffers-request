@@ -1,2 +1,6 @@
 # Normalize line endings to LF in the repository for all text files.
 * text=auto eol=lf
+
+# Binary fixtures must never be touched by line-ending normalization.
+*.bin binary
+*.bfbs binary
