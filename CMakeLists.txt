@@ -56,6 +56,12 @@ cpp_library(
             flatbuffers::flatbuffers
 )
 
+# cpp_library sets CXX_STANDARD only as a private build property, so the
+# language level does not flow to consumers of the installed/exported target.
+# The public headers use std::optional / std::span / std::string_view, so
+# export the requirement to make find_package() consumers compile as C++23.
+target_compile_features(FlatbuffersRequest PUBLIC cxx_std_23)
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
