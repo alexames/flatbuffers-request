@@ -10,7 +10,7 @@ patch player { put name "Aria" ; delete title }
 delete inventory[3]
 ```
 
-> Status: **v0.1.0**, extracted from the [Composer](https://github.com/alexames) engine's editor. Tables, vectors, unions, strings, scalars and structs are supported. Fixed-size arrays are not yet implemented.
+> Status: **v0.2.0**, extracted from the [Composer](https://github.com/alexames) engine's editor. Tables, vectors, unions, strings, scalars and structs are supported. Fixed-size arrays are not yet implemented.
 
 ## Install (vcpkg)
 
@@ -59,7 +59,7 @@ void bump_health(const reflection::Schema* schema,
   fbb.Finish(fbrequest::applyRequest(
       fbb, schema,
       flatbuffers::GetAnyRoot(current.data()),
-      request->get()));
+      flatbuffers::GetRoot<serialized::Request>(request->data())));
 
   // fbb.GetBufferPointer() / fbb.GetSize() now hold the updated buffer.
 }

@@ -56,7 +56,7 @@ class RequestTestBase : public ::testing::TestWithParam<TestArgs> {
     builder.Finish(applyRequest(
         builder, schema_, flatbuffers::GetAnyRoot(emptyBuffer_.data()),
         // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-        request->get()));
+        flatbuffers::GetRoot<serialized::Request>(request->data())));
 
     auto verifier =
         flatbuffers::Verifier(builder.GetBufferPointer(), builder.GetSize());
@@ -292,7 +292,7 @@ TEST_P(UpdateTableTest, PutScalarInRoot) {
   fbb.Finish(applyRequest(fbb, schema_,
                           flatbuffers::GetAnyRoot(startingValue.buffer().data()),
                           // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-                          request->get()));
+                          flatbuffers::GetRoot<serialized::Request>(request->data())));
   auto updated = fbb.Release();
   auto expected = GetBuffer(args.final);
 
@@ -371,7 +371,7 @@ TEST_P(DeleteTableTest, Delete) {
   fbb.Finish(applyRequest(
       fbb, schema_, flatbuffers::GetAnyRoot(startingValue.buffer().data()),
       // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-      request->get()));
+      flatbuffers::GetRoot<serialized::Request>(request->data())));
   auto updated = fbb.Release();
   auto expected = GetBuffer(args.final);
 
@@ -419,7 +419,7 @@ TEST_P(PatchTableTest, Patch) {
   fbb.Finish(applyRequest(
       fbb, schema_, flatbuffers::GetAnyRoot(startingValue.buffer().data()),
       // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-      request->get()));
+      flatbuffers::GetRoot<serialized::Request>(request->data())));
   auto updated = fbb.Release();
   auto expected = GetBuffer(args.final);
 
@@ -451,10 +451,10 @@ class StructDeleteTest : public ::testing::Test {
     flatbuffers::FlatBufferBuilder fbb;
     auto parsed = parseFlatbufferRequest(schema_, request);
     EXPECT_TRUE(parsed.has_value()) << request;
-    fbb.Finish(
-        applyRequest(fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
-                     // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-                     parsed->get()));
+    fbb.Finish(applyRequest(
+        fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+        flatbuffers::GetRoot<serialized::Request>(parsed->data())));
     return fbb.Release();
   }
 

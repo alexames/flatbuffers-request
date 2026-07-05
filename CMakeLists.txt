@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(FlatbuffersRequest
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "Reflection-driven put/patch/delete requests for FlatBuffers"
   HOMEPAGE_URL "https://github.com/alexames/flatbuffers-request"
   LANGUAGES CXX)
@@ -49,7 +49,6 @@ cpp_library(
         "StringScan.cpp"
     HEADERS
         "fbrequest/FlatbufferRequest.hpp"
-        "fbrequest/TypedBuffer.hpp"
     DEPENDENCIES
         PUBLIC
             RequestSchemas

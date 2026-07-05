@@ -59,7 +59,7 @@ but a larger rework; it is intentionally deferred.
 ## Layout
 
 ```
-include/fbrequest/   public headers (FlatbufferRequest.hpp, TypedBuffer.hpp)
+include/fbrequest/   public headers (FlatbufferRequest.hpp)
 src/                 apply + parse + StringScan (private scan helpers)
 schemas/fbrequest/   the Request schema
 test/                GoogleTest suite + vendored reflection matchers

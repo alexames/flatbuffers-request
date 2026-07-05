@@ -24,7 +24,6 @@ using serialized::FinishRequestBuffer;
 using serialized::Operation;
 using serialized::Patch;
 using serialized::Put;
-using serialized::Request;
 
 namespace {
 
@@ -388,9 +387,8 @@ std::optional<Operation> parseFlatbufferOperationEnum(
 }  // namespace
 
 // NOLINTNEXTLINE(misc-use-internal-linkage)
-std::optional<fbrequest::TypedBuffer<serialized::Request>>
-fbrequest::parseFlatbufferRequest(const reflection::Schema* schema,
-                                  std::string_view requestString) {
+std::optional<fbrequest::ByteBuffer> fbrequest::parseFlatbufferRequest(
+    const reflection::Schema* schema, std::string_view requestString) {
   auto operation = parseFlatbufferOperationEnum(&requestString);
   if (not operation) {
     return std::nullopt;
@@ -408,5 +406,5 @@ fbrequest::parseFlatbufferRequest(const reflection::Schema* schema,
   auto* buffer = fbb.GetBufferPointer();
   auto size = fbb.GetSize();
 
-  return TypedBuffer<Request>{ByteBuffer{buffer, buffer + size}};
+  return ByteBuffer{buffer, buffer + size};
 }

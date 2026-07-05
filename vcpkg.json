@@ -1,6 +1,6 @@
 {
   "name": "flatbuffers-request",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Reflection-driven put/patch/delete requests for FlatBuffers binaries.",
   "homepage": "https://github.com/alexames/flatbuffers-request",
   "license": "Apache-2.0",

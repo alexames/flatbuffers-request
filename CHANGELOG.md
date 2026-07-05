@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-05
+
+### Changed
+- **Breaking:** `parseFlatbufferRequest` now returns `std::optional<ByteBuffer>`
+  (an owned `std::vector<uint8_t>`) instead of `std::optional<TypedBuffer<Request>>`.
+  Read the result with `flatbuffers::GetRoot<serialized::Request>(buffer.data())`.
+
+### Removed
+- The `TypedBuffer` class template and its header. It was only a thin owned-buffer
+  wrapper around the parse result and carried unused machinery; the plain buffer
+  is a simpler API surface.
+
 ## [0.1.0] - 2026-07-04
 
 Initial release, extracted from the Composer engine.
@@ -26,5 +38,6 @@ Initial release, extracted from the Composer engine.
 - Deleting an individual field inside a struct is a no-op (structs are
   indivisible).
 
-[Unreleased]: https://github.com/alexames/flatbuffers-request/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/alexames/flatbuffers-request/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/alexames/flatbuffers-request/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/alexames/flatbuffers-request/releases/tag/v0.1.0
