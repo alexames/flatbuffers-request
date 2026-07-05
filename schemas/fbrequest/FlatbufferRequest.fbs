@@ -1,0 +1,34 @@
+// Schema for serialized FlatbufferRequest operations (put / patch / delete).
+//
+// A Request wraps a single Operation. Put stores a flexbuffer-encoded payload
+// plus the reflection offset path to the target field; Patch carries a nested
+// list of operations applied relative to a subobject; Delete removes the field
+// or vector element identified by its offset path.
+
+namespace serialized;
+
+union Operation {
+  Put,
+  Patch,
+  Delete
+}
+
+table Put {
+  offsets: [uint16];
+  payload: [uint8] (flexbuffer);
+}
+
+table Patch {
+  offsets: [uint16];
+  updates: [Operation];
+}
+
+table Delete {
+  offsets: [uint16];
+}
+
+table Request {
+  operation: Operation;
+}
+
+root_type Request;

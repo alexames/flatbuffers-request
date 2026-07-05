@@ -1,0 +1,19 @@
+{
+  "name": "flatbuffers-request",
+  "version": "0.1.0",
+  "description": "Reflection-driven put/patch/delete requests for FlatBuffers binaries.",
+  "homepage": "https://github.com/alexames/flatbuffers-request",
+  "license": "Apache-2.0",
+  "dependencies": [
+    "flatbuffers",
+    "targets",
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    },
+    {
+      "name": "vcpkg-cmake-config",
+      "host": true
+    }
+  ]
+}

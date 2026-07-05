@@ -1,0 +1,23 @@
+# Build output
+build/
+Build/
+out/
+cmake-build-*/
+
+# vcpkg
+vcpkg_installed/
+vcpkg/
+
+# CMake user files
+CMakeUserPresets.json
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store

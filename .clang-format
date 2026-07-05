@@ -1,0 +1,6 @@
+BasedOnStyle: Google
+---
+Language: Cpp
+BreakBeforeBinaryOperators : NonAssignment
+Cpp11BracedListStyle: true
+QualifierAlignment: Left

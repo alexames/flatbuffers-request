@@ -1,0 +1,85 @@
+// Copyright 2022 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Exercises every FlatBuffer kind (scalar, struct, string, union, nested table, and vector variants) so FlatbufferRequest round-tripping has full type coverage.
+
+namespace matcher_test;
+
+table Integer {
+  value: int32;
+}
+
+table FloatingPoint {
+  value: float32;
+}
+
+union Number {
+  Integer,
+  FloatingPoint
+}
+
+struct ScalarStruct {
+  b: bool;
+  i8: int8;
+  ui8: uint8;
+  i16: int16;
+  ui16: uint16;
+  i32: int32;
+  ui32: uint32;
+  i64: int64;
+  ui64: uint64;
+  f32: float32;
+  f64: float64;
+
+  i32_array: [int32:10];
+}
+
+table TestSchema {
+  b: bool;
+  i8: int8;
+  ui8: uint8;
+  i16: int16;
+  ui16: uint16;
+  i32: int32;
+  ui32: uint32;
+  i64: int64;
+  ui64: uint64;
+  f32: float32;
+  f64: float64;
+
+  string: string;
+  // Self-referential here (and as object_vector below) so recursive tables get exercised during round-trip.
+  object: TestSchema;
+  number: Number;
+  scalars: ScalarStruct;
+
+  b_vector: [bool];
+  i8_vector: [int8];
+  ui8_vector: [uint8];
+  i16_vector: [int16];
+  ui16_vector: [uint16];
+  i32_vector: [int32];
+  ui32_vector: [uint32];
+  i64_vector: [int64];
+  ui64_vector: [uint64];
+  f32_vector: [float32];
+  f64_vector: [float64];
+
+  string_vector: [string];
+  object_vector: [TestSchema];
+  number_vector: [Number];
+  struct_vector: [ScalarStruct];
+}
+
+root_type TestSchema;

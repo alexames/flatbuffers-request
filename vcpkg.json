@@ -1,0 +1,23 @@
+{
+  "name": "flatbuffers-request",
+  "version": "0.1.0",
+  "description": "Reflection-driven put/patch/delete requests for FlatBuffers binaries.",
+  "homepage": "https://github.com/alexames/flatbuffers-request",
+  "license": "Apache-2.0",
+  "builtin-baseline": "05442024c3fda64320bd25d2251cc9807b84fb6f",
+  "dependencies": [
+    {
+      "name": "flatbuffers",
+      "version>=": "25.12.19"
+    },
+    "targets"
+  ],
+  "features": {
+    "tests": {
+      "description": "Build the unit test suite (GoogleTest).",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
+}

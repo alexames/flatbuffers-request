@@ -1,0 +1,12 @@
+flatbuffers-request
+Copyright 2024-2026 Alexander Ames
+
+This product includes software developed at Google LLC.
+
+The test-support matchers under test/matchers/ (FlatbufferMatcher,
+FlexbufferMatcher, and MatcherInternal) are derived from code
+Copyright 2022 Google LLC, licensed under the Apache License, Version 2.0.
+The original copyright and license headers are retained in those files.
+
+This product depends on FlatBuffers (https://github.com/google/flatbuffers),
+Copyright 2014 Google Inc., licensed under the Apache License, Version 2.0.

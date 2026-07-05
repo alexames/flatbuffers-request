@@ -1,0 +1,17 @@
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "05442024c3fda64320bd25d2251cc9807b84fb6f"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/alexames/vcpkg-registry",
+      "baseline": "c357c77a9384591907fd411c4ed5d7df32017943",
+      "packages": [
+        "targets"
+      ]
+    }
+  ]
+}
