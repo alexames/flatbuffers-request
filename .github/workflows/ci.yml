@@ -21,7 +21,7 @@ jobs:
           - { name: Windows MSVC, os: windows-latest }
           - { name: macOS Clang,  os: macos-latest }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: lukka/get-cmake@latest
       - name: Set up MSVC
         if: runner.os == 'Windows'
@@ -47,7 +47,7 @@ jobs:
     name: clang-format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check formatting
         shell: bash
         run: |
@@ -62,7 +62,7 @@ jobs:
       ASAN_OPTIONS: abort_on_error=1:detect_container_overflow=0
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: lukka/get-cmake@latest
       - name: Configure
         run: |
@@ -83,7 +83,7 @@ jobs:
     env:
       ASAN_OPTIONS: detect_container_overflow=0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: lukka/get-cmake@latest
       - name: Configure
         run: |
