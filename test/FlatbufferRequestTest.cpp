@@ -448,9 +448,9 @@ TEST_P(PatchTableTest, Patch) {
 // misreads inline struct bytes as table offsets), so these verify the struct
 // delete fixes directly through the generated reflection accessors.
 namespace {
-class StructDeleteTest : public ::testing::Test {
+class BufferRequestTest : public ::testing::Test {
  protected:
-  StructDeleteTest()
+  BufferRequestTest()
       : schema_((flatbuffers::LoadFile("test_schema.bfbs", true, &bfbs_),
                  reflection::GetSchema(bfbs_.data()))) {}
 
@@ -462,8 +462,10 @@ class StructDeleteTest : public ::testing::Test {
     return {buffer.data(), buffer.data() + buffer.size()};
   }
 
-  flatbuffers::DetachedBuffer applyReq(const std::vector<uint8_t>& initial,
-                                       const char* request) {
+  /// Applies `request` to `initial` and verifies the result, so a test that
+  /// reads a field off the answer is reading a buffer known to be well formed.
+  flatbuffers::DetachedBuffer applyRequestTo(
+      const std::vector<uint8_t>& initial, const char* request) {
     flatbuffers::FlatBufferBuilder fbb;
     auto parsed = parseFlatbufferRequest(schema_, request);
     EXPECT_TRUE(parsed.has_value()) << request;
@@ -471,12 +473,17 @@ class StructDeleteTest : public ::testing::Test {
         fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
         // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
         flatbuffers::GetRoot<serialized::Request>(parsed->data())));
-    return fbb.Release();
+    auto result = fbb.Release();
+    auto verifier = flatbuffers::Verifier(result.data(), result.size());
+    EXPECT_TRUE(matcher_test::VerifyTestSchemaBuffer(verifier)) << request;
+    return result;
   }
 
   std::string bfbs_;
   const reflection::Schema* schema_;
 };
+
+class StructDeleteTest : public BufferRequestTest {};
 
 const char* kStructA =
     R"({"b":false,"i8":1,"ui8":0,"i16":0,"ui16":0,"i32":0,"ui32":0,"i64":0,)"
@@ -489,7 +496,7 @@ const char* kStructB =
 TEST_F(StructDeleteTest, DeletesStructVectorElement) {
   auto initial = GetBuffer(std::string(R"({"struct_vector": [)") + kStructA
                            + "," + kStructB + "]}");
-  auto result = applyReq(initial, "delete struct_vector[0]");
+  auto result = applyRequestTo(initial, "delete struct_vector[0]");
 
   flatbuffers::Verifier verifier(result.data(), result.size());
   ASSERT_TRUE(matcher_test::VerifyTestSchemaBuffer(verifier));
@@ -502,7 +509,7 @@ TEST_F(StructDeleteTest, DeletesStructVectorElement) {
 
 TEST_F(StructDeleteTest, DeleteFieldInsideStructIsNoOp) {
   auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructA + "}");
-  auto result = applyReq(initial, "delete scalars.i8");
+  auto result = applyRequestTo(initial, "delete scalars.i8");
 
   flatbuffers::Verifier verifier(result.data(), result.size());
   ASSERT_TRUE(matcher_test::VerifyTestSchemaBuffer(verifier));
@@ -510,4 +517,269 @@ TEST_F(StructDeleteTest, DeleteFieldInsideStructIsNoOp) {
   ASSERT_NE(ts->scalars(), nullptr);
   // The struct is indivisible, so the delete is a no-op: i8 is still 1.
   EXPECT_EQ(ts->scalars()->i8(), 1);
+}
+
+// An enum-typed field is a SCALAR whose reflection Type also carries an
+// `index`, naming the enum. A parser deciding "is the payload a table" from
+// `index` alone sends these to the table parser, which has no object to parse
+// against and refuses the whole request.
+class EnumFieldTest : public BufferRequestTest {};
+
+TEST_F(EnumFieldTest, PutsAnEnumScalarByOrdinal) {
+  auto initial = GetBuffer(R"({"i32": 10})");
+  auto result = applyRequestTo(initial, "put color 4");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->color(), matcher_test::Color::Green);
+  // The request names one field and must leave the rest alone.
+  EXPECT_EQ(ts->i32(), 10);
+}
+
+TEST_F(EnumFieldTest, PutsAnEnumVectorElementByOrdinal) {
+  auto initial = GetBuffer(R"({"color_vector": ["Red", "Red", "Red"]})");
+  auto result = applyRequestTo(initial, "put color_vector[1] 5");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->color_vector(), nullptr);
+  ASSERT_EQ(ts->color_vector()->size(), 3U);
+  EXPECT_EQ(ts->color_vector()->Get(0), matcher_test::Color::Red);
+  EXPECT_EQ(ts->color_vector()->Get(1), matcher_test::Color::Blue);
+  EXPECT_EQ(ts->color_vector()->Get(2), matcher_test::Color::Red);
+}
+
+TEST_F(EnumFieldTest, PutsAWholeEnumVector) {
+  auto initial = GetBuffer(R"({"i32": 10})");
+  auto result = applyRequestTo(initial, "put color_vector [0, 4, 5]");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->color_vector(), nullptr);
+  ASSERT_EQ(ts->color_vector()->size(), 3U);
+  EXPECT_EQ(ts->color_vector()->Get(1), matcher_test::Color::Green);
+}
+
+TEST_F(EnumFieldTest, DeletesAnEnumScalar) {
+  auto initial = GetBuffer(R"({"color": "Blue", "i32": 10})");
+  auto result = applyRequestTo(initial, "delete color");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->color(), matcher_test::Color::Red);
+  EXPECT_EQ(ts->i32(), 10);
+}
+
+// A struct is stored INLINE in its parent, with no vtable and no offset of its
+// own, so every field of it is always present and the whole of it is rewritten
+// whenever any part is. These pin that a put reaches one.
+class StructPutTest : public BufferRequestTest {};
+
+TEST_F(StructPutTest, PutsAMemberOfAStoredStruct) {
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructA + "}");
+  auto result = applyRequestTo(initial, "put scalars.i8 7");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i8(), 7);
+}
+
+TEST_F(StructPutTest, PutsAMemberAndLeavesTheStructsOtherMembers) {
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
+  auto result = applyRequestTo(initial, "put scalars.i8 7");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i8(), 7);
+  // kStructB carries b == true, which the request does not name.
+  EXPECT_TRUE(ts->scalars()->b());
+}
+
+TEST_F(StructPutTest, PutsAMemberOfAStructTheBufferDoesNotStore) {
+  auto initial = GetBuffer(R"({"i32": 10})");
+  auto result = applyRequestTo(initial, "put scalars.i8 7");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i8(), 7);
+  // Everything the request did not name starts from the struct's zeroes.
+  EXPECT_EQ(ts->scalars()->i32(), 0);
+  EXPECT_EQ(ts->i32(), 10);
+}
+
+TEST_F(StructPutTest, PutsAWholeStruct) {
+  auto initial = GetBuffer(R"({"i32": 10})");
+  auto result =
+      applyRequestTo(initial, (std::string("put scalars ") + kStructB).c_str());
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i8(), 2);
+  EXPECT_TRUE(ts->scalars()->b());
+}
+
+TEST_F(StructPutTest, PutsAnElementOfAFixedLengthArrayInAStruct) {
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructA + "}");
+  auto result = applyRequestTo(initial, "put scalars.i32_array[3] 9");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(3), 9);
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(2), 0);
+}
+
+TEST_F(StructPutTest, PutsAWholeFixedLengthArray) {
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructA + "}");
+  auto result = applyRequestTo(initial, "put scalars.i32_array [7, 8]");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(0), 7);
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(1), 8);
+  // A fixed-length array cannot shrink, so the elements the payload does not
+  // reach keep what they had.
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(2), 0);
+  EXPECT_EQ(ts->scalars()->i32_array()->size(), 10U);
+}
+
+TEST_F(StructPutTest, LeavesAFixedLengthArrayAloneWhenThePayloadIsTooLong) {
+  // A fixed-length array cannot grow either. There is no error channel in an
+  // apply, so the request writes nothing rather than writing part of itself
+  // or running off the end of the struct.
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructA + "}");
+  auto result = applyRequestTo(
+      initial, "put scalars.i32_array [1,2,3,4,5,6,7,8,9,10,11]");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(0), 0);
+  EXPECT_EQ(ts->scalars()->i32_array()->size(), 10U);
+}
+
+TEST_F(StructPutTest, PutsAnArrayElementOfAStructTheBufferDoesNotStore) {
+  auto initial = GetBuffer(R"({"i32": 10})");
+  auto result = applyRequestTo(initial, "put scalars.i32_array[2] 5");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(2), 5);
+  EXPECT_EQ(ts->scalars()->i32_array()->Get(1), 0);
+  EXPECT_EQ(ts->scalars()->i8(), 0);
+}
+
+TEST_F(StructPutTest, PutsPartOfAStructAndKeepsTheRest) {
+  // A map naming some members: the others keep what the buffer stored, which
+  // is what makes a whole-struct put usable as an edit rather than a replace.
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
+  auto result = applyRequestTo(initial, R"(put scalars {"i16": 40})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i16(), 40);
+  EXPECT_EQ(ts->scalars()->i8(), 2);
+  EXPECT_TRUE(ts->scalars()->b());
+}
+
+// Requests the library refuses rather than serving wrongly. Each of these
+// reached an apply that wrote a wrong value, built a corrupt buffer, or read
+// off the end of one.
+class RefusedPutTest : public BufferRequestTest {};
+
+TEST_F(RefusedPutTest, RefusesAnEnumByName) {
+  // Apply reads a string as a number, which answers 0 for every name, so a
+  // name accepted here would silently write Red. An ordinal is the spelling.
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, R"(put color "Blue")").has_value());
+  EXPECT_FALSE(parseFlatbufferRequest(schema_, "put color Blue").has_value());
+  EXPECT_TRUE(parseFlatbufferRequest(schema_, "put color 5").has_value());
+}
+
+TEST_F(RefusedPutTest, RefusesAStringWhereANumberBelongs) {
+  EXPECT_FALSE(parseFlatbufferRequest(schema_, R"(put i32 "ten")").has_value());
+  EXPECT_TRUE(parseFlatbufferRequest(schema_, "put i32 10").has_value());
+}
+
+TEST_F(RefusedPutTest, RefusesAStructPayloadThatIsNotAMap) {
+  // It used to create a struct of zeroes: the payload named no member, and
+  // the image was pushed anyway.
+  EXPECT_FALSE(parseFlatbufferRequest(schema_, "put scalars 5").has_value());
+}
+
+TEST_F(RefusedPutTest, RefusesWritingAnElementOfAVectorOfStructs) {
+  // The apply builds no offset for an inline element while the table builder
+  // still consumes one, which reads a neighbouring field's offset.
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, "put struct_vector[0].i8 5").has_value());
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, R"(put struct_vector [{"i8": 1}])")
+          .has_value());
+}
+
+TEST_F(RefusedPutTest, StillDeletesAnElementOfAVectorOfStructs) {
+  // A delete removes a whole element, which is well defined where writing one
+  // is not, so the refusal above must not reach it.
+  EXPECT_TRUE(
+      parseFlatbufferRequest(schema_, "delete struct_vector[0]").has_value());
+}
+
+TEST_F(RefusedPutTest, RefusesAWholeVectorOfUnions) {
+  // A union vector pairs with a vector of discriminators that a JSON array
+  // cannot carry, and its type index names the ENUM rather than an object.
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, R"(put number_vector [{"value": 1}])")
+          .has_value());
+}
+
+// A struct member that is itself a struct, and an array whose elements are
+// structs.
+class NestedStructTest : public BufferRequestTest {};
+
+TEST_F(NestedStructTest, PutsAMemberOfAStructInsideAStruct) {
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               "put nested.inner.a 3");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->nested(), nullptr);
+  EXPECT_EQ(ts->nested()->inner().a(), 3);
+  EXPECT_EQ(ts->nested()->tail(), 0);
+}
+
+TEST_F(NestedStructTest, PutsAnArrayElementInsideANestedStruct) {
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               "put nested.inner.arr[1] 55");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->nested(), nullptr);
+  EXPECT_EQ(ts->nested()->inner().arr()->Get(1), 55);
+  EXPECT_EQ(ts->nested()->inner().arr()->Get(0), 0);
+}
+
+TEST_F(NestedStructTest, PutsAMemberAfterANestedStructWithoutDisturbingIt) {
+  auto result = applyRequestTo(
+      GetBuffer(R"({"i32": 10})"),
+      R"(put nested {"inner": {"a": 4}, "tail": 77})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->nested(), nullptr);
+  EXPECT_EQ(ts->nested()->inner().a(), 4);
+  EXPECT_EQ(ts->nested()->tail(), 77);
+}
+
+TEST_F(NestedStructTest, RefusesAnElementOfAnArrayOfStructs) {
+  // The same rule as a vector of structs: the element is inline and nothing
+  // builds one.
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, "put nested.structs[0].a 2").has_value());
+}
+
+TEST_F(NestedStructTest, WritesNothingIntoAnArrayOfStructsNamedInAMap) {
+  // The stride for a struct element is its byte size, which `GetTypeSize`
+  // does not answer, so nothing writes one. The struct keeps what it had
+  // rather than being written at the wrong stride.
+  auto initial = GetBuffer(R"({"nested": {"inner": {"a": 1, "arr": [0,0,0]},)"
+                           R"( "structs": [{"a": 8, "arr": [0,0,0]},)"
+                           R"( {"a": 9, "arr": [0,0,0]}], "tail": 3}})");
+  auto result =
+      applyRequestTo(initial, R"(put nested {"structs": [{"a": 2}]})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->nested(), nullptr);
+  EXPECT_EQ(ts->nested()->structs()->Get(0)->a(), 8);
+  EXPECT_EQ(ts->nested()->tail(), 3);
+}
+
+TEST_F(NestedStructTest, LeavesAnAbsentStructAbsentWhenNothingIsWritten) {
+  // A refused write must not leave a struct of zeroes where there was none.
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               R"(put nested {"structs": [{"a": 2}]})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->nested(), nullptr);
+  EXPECT_EQ(ts->i32(), 10);
+}
+
+TEST_F(NestedStructTest, LeavesAnAbsentStructAbsentWhenAnArrayIsTooLong) {
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               "put scalars.i32_array [1,2,3,4,5,6,7,8,9,10,11]");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->i32(), 10);
 }

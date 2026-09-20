@@ -38,6 +38,17 @@ union Number {
   Fraction
 }
 
+// An enum-typed scalar. Its reflection Type carries an `index` naming the
+// enum, exactly as a table's Type carries one naming the object, so a parser
+// deciding "is this a table" from `index` alone mistakes one for the other.
+// Non-contiguous on purpose: an ordinal that equals its position would hide a
+// parser writing positions instead of values.
+enum Color : ubyte {
+  Red,
+  Green = 4,
+  Blue,
+}
+
 struct ScalarStruct {
   b: bool;
   i8: int8;
@@ -52,6 +63,19 @@ struct ScalarStruct {
   f64: float64;
 
   i32_array: [int32:10];
+}
+
+// A struct inside a struct, and an array whose elements are structs: the
+// first is written member by member, the second is not written at all.
+struct Inner {
+  a: int8;
+  arr: [int16:3];
+}
+
+struct Nested {
+  inner: Inner;
+  structs: [Inner:2];
+  tail: int32;
 }
 
 table TestSchema {
@@ -89,6 +113,12 @@ table TestSchema {
   object_vector: [TestSchema];
   number_vector: [Number];
   struct_vector: [ScalarStruct];
+
+  // Appended, so the vtable slots the golden buffers were built with do not
+  // shift.
+  color: Color;
+  color_vector: [Color];
+  nested: Nested;
 }
 
 root_type TestSchema;

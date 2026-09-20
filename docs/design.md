@@ -29,11 +29,43 @@ table), but path resolution is a cheap integer walk.
 
 ## Structs and arrays
 
-- **Structs** are inline, fixed-layout, and indivisible. A `put`/`delete` may
-  replace or copy a whole struct field but cannot add or remove an individual
-  struct member — such a `delete` is a documented no-op.
-- **Fixed-size arrays** (`[T:N]`) are **not yet supported**; apply asserts if it
-  reaches one. This is the main known gap.
+A struct is stored inline in whatever holds it, with no vtable and no offset of
+its own, so its members are all always present and the whole of it is rewritten
+whenever any part is. Apply therefore builds a struct as a byte **image** — the
+stored bytes where the buffer has them, zeroes where it does not — writes the
+payload into that image, and pushes it inline.
+
+- **`put` reaches a struct member** (`put scalars.i8 7`), a whole struct
+  (`put scalars {...}`, a map naming any subset of members, the rest keeping
+  what they had), and a struct the buffer does not store yet (the unnamed
+  members start from zero).
+- **`delete` of a struct member remains a no-op**: a struct has no way to
+  record that a member is absent, so there is nothing for a delete to do.
+- **Fixed-size arrays of scalars** inside a struct take a put by element
+  (`put scalars.i32_array[3] 9`) or whole (`put scalars.i32_array [7, 8]`,
+  leaving the elements the payload does not reach). An array cannot grow or
+  shrink, so a payload longer than `N` writes nothing at all.
+- **A write that writes nothing leaves the field as it was**, including
+  leaving an absent struct absent rather than creating one of zeroes.
+
+A `put` is REFUSED, rather than served wrongly, for:
+
+- an element of a vector or array **of structs** (`put struct_vector[0].i8 5`,
+  `put nested.structs[0].a 2`) and a whole vector of structs. A struct element
+  is inline: apply builds no offset for one while the table builder still
+  consumes one, which would read a neighbouring field's offset.
+- a whole vector of **unions**, whose element types live in a second vector
+  that a JSON array cannot carry.
+- a payload of the wrong kind for its field — a string where a number belongs
+  (so an enum takes its ordinal, never its name, which would read as 0), or a
+  non-map for a struct.
+
+A `delete` is unaffected by those refusals: removing a whole element is well
+defined where writing one is not, so `delete struct_vector[0]` still works.
+
+A struct payload is carried as a **flexbuffer map**, not as a table: a struct
+cannot be a parser root type, and apply writes its members by name into the
+image.
 
 ## Coupling to FlatBuffers internals
 

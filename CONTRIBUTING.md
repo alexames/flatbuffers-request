@@ -12,6 +12,21 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+**Run the asserting build too, and run its binary directly.** Much of this
+library's contract with FlatBuffers is enforced by `assert`, which a Release
+build compiles out -- a request that trips one passes the Release suite and
+aborts in a consumer's debug build. With a multi-config generator, test
+discovery records the exe path of whichever configuration was built last, so
+`ctest -C Debug` can silently re-run the Release binary and report green:
+
+```bash
+cmake --build build --config Debug
+cd build/flatbuffers && ../Debug/FlatbufferRequestTest.exe
+```
+
+`build/flatbuffers` is the working directory the suite needs, because it loads
+`test_schema.bfbs` by a relative path.
+
 New behaviour needs tests; bug fixes need a reproducing test. The suite lives in
 [test/FlatbufferRequestTest.cpp](test/FlatbufferRequestTest.cpp) and is mostly
 parameterized `(initial, request, expected)` triples — adding a case is usually

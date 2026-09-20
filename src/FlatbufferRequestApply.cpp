@@ -1,5 +1,6 @@
 #include <array>
 #include <cstring>
+#include <optional>
 #include <span>
 
 #include "fbrequest/FlatbufferRequest.hpp"
@@ -192,6 +193,159 @@ static void getFlexbufferScalarDataPointer(flexbuffers::Reference reference,
 
 // TODO: Clean this up. Does it need to be one giant function?
 // This should probably be refactored.
+// ---------------------------------------------------------------------------
+// Structs
+//
+// A struct is stored INLINE in whatever holds it, with no vtable and no offset
+// of its own: its members sit at fixed byte offsets and are all always
+// present. So a struct is never edited in place -- the whole of it is built as
+// an image and pushed, and a request naming one member is the source image
+// with that member overwritten. A struct the buffer does not store starts from
+// zeroes, which is what every member of an absent struct reads as.
+// ---------------------------------------------------------------------------
+
+// The member of `structDef` stored at `offset` bytes into it.
+static const reflection::Field* structFieldAtOffset(
+    const reflection::Object* structDef, uint16_t offset) {
+  for (const auto* fieldDef : *structDef->fields()) {
+    if (fieldDef->offset() == offset) {
+      return fieldDef;
+    }
+  }
+  return nullptr;
+}
+
+static void writeScalarInto(flexbuffers::Reference value,
+                            reflection::BaseType type, std::span<uint8_t> at) {
+  auto bytes = std::array<uint8_t, 8>{};
+  getFlexbufferScalarDataPointer(value, type, &bytes);
+  const auto size = GetTypeSize(type);
+  if (at.size() < size) {
+    return;
+  }
+  std::memcpy(at.data(), bytes.data(), size);
+}
+
+static bool writeStructMember(const reflection::Schema* schema,
+                              const reflection::Object* structDef,
+                              std::span<uint8_t> image,
+                              std::span<const uint16_t> path,
+                              flexbuffers::Reference value);
+
+// Writes every member `map` names into `image`, leaving the rest as they were.
+// A name the struct does not declare is ignored rather than refused: the
+// payload is parsed as a flexbuffer, which cannot be checked against the
+// schema until here, and a struct has no way to carry an unknown member.
+static bool writeStructMap(const reflection::Schema* schema,
+                           const reflection::Object* structDef,
+                           std::span<uint8_t> image, flexbuffers::Map map) {
+  auto keys = map.Keys();
+  auto values = map.Values();
+  for (size_t i = 0; i < keys.size(); i++) {
+    const auto* fieldDef = structDef->fields()->LookupByKey(keys[i].AsKey());
+    if (fieldDef == nullptr) {
+      continue;
+    }
+    const auto memberOffset = fieldDef->offset();
+    if (not writeStructMember(schema, structDef, image,
+                              std::span{&memberOffset, 1}, values[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Writes `value` into the member `path` names, `path` being byte offsets into
+// successively nested structs and, for a fixed-length array, the element
+// index. An empty `path` means `value` is a map of the whole struct.
+static bool writeStructMember(const reflection::Schema* schema,
+                              const reflection::Object* structDef,
+                              std::span<uint8_t> image,
+                              std::span<const uint16_t> path,
+                              flexbuffers::Reference value) {
+  if (path.empty()) {
+    return value.IsMap() and writeStructMap(schema, structDef, image,
+                                            value.AsMap());
+  }
+  const auto* fieldDef = structFieldAtOffset(structDef, path.front());
+  if (fieldDef == nullptr or fieldDef->offset() >= image.size()) {
+    return false;
+  }
+  auto at = image.subspan(fieldDef->offset());
+  const auto baseType = fieldDef->type()->base_type();
+  const auto rest = path.subspan(1);
+
+  if (baseType == reflection::Obj) {
+    const auto* nested = schema->objects()->Get(fieldDef->type()->index());
+    return writeStructMember(schema, nested, at.first(nested->bytesize()),
+                             rest, value);
+  }
+  if (baseType == reflection::Array) {
+    const auto elementType = fieldDef->type()->element();
+    if (not IsScalar(elementType)) {
+      // An array of structs: `GetTypeSize` answers a pointer's width for one,
+      // not the struct's, so every element would be written at the wrong
+      // stride. Nothing writes one, so nothing is written.
+      return false;
+    }
+    const auto elementSize = GetTypeSize(elementType);
+    const auto length = size_t{fieldDef->type()->fixed_length()};
+    if (rest.empty()) {
+      // The whole array, as a flexbuffer vector. A shorter one leaves the
+      // elements it does not reach; a longer one is refused, because a
+      // fixed-length array cannot grow.
+      if (not value.IsVector()) {
+        return false;
+      }
+      auto elements = value.AsVector();
+      if (elements.size() > length) {
+        return false;
+      }
+      for (size_t i = 0; i < elements.size(); i++) {
+        writeScalarInto(elements[static_cast<int>(i)], elementType,
+                        at.subspan(i * elementSize));
+      }
+      return true;
+    }
+    const auto index = size_t{rest.front()};
+    if (index >= length or rest.size() != 1) {
+      return false;
+    }
+    writeScalarInto(value, elementType, at.subspan(index * elementSize));
+    return true;
+  }
+  if (not rest.empty() or not IsScalar(baseType)) {
+    return false;
+  }
+  writeScalarInto(value, baseType, at);
+  return true;
+}
+
+// The image of the struct `fieldDef` names after `payload` is written into it
+// at `path`: the source's bytes where the buffer stores one, zeroes where it
+// does not. Nothing where the payload names no member the struct can hold --
+// a fixed-length array too long for its field, say -- so that a request which
+// writes nothing does not leave a struct of zeroes where there was none.
+static std::optional<std::vector<uint8_t>> buildStructImage(
+    const reflection::Schema* schema, const reflection::Object* structDef,
+    const reflection::Field* fieldDef, const Table* sourceTable,
+    bool fieldInSource, std::span<const uint8_t> payload,
+    std::span<const uint16_t> path) {
+  auto image = std::vector<uint8_t>(structDef->bytesize(), uint8_t{0});
+  if (fieldInSource) {
+    const auto* stored =
+        sourceTable->GetStruct<const uint8_t*>(fieldDef->offset());
+    if (stored != nullptr) {
+      std::memcpy(image.data(), stored, image.size());
+    }
+  }
+  const auto value = flexbuffers::GetRoot(payload.data(), payload.size());
+  if (not writeStructMember(schema, structDef, image, path, value)) {
+    return std::nullopt;
+  }
+  return image;
+}
+
 static uoffset_t copyPayload(FlatBufferBuilder& fbb,
                              const reflection::Schema* schema,
                              const reflection::Field* fieldDef,
@@ -270,6 +424,12 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
     case reflection::Obj: {
       const auto* subTableDef =
           schema->objects()->Get(fieldDef->type()->index());
+      if (subTableDef->is_struct()) {
+        // A struct has no offset of its own: it is written inline, by the
+        // table builder, out of a flexbuffer payload. Reading that payload as
+        // a table root here would be reading it as something it is not.
+        return 0;
+      }
       return CopyTable(fbb, *schema, *subTableDef, *GetAnyRoot(payload.data()),
                        useStringPooling)
           .o;
@@ -819,12 +979,29 @@ static void applyRequestPut_BuildTableField(
       if (inPath or fieldInSource) {
         const auto* subtableDef =
             schema->objects()->Get(fieldDef->type()->index());
-        if (subtableDef->is_struct()) {
-          copyInline(fbb, fieldDef, sourceTable, subtableDef->minalign(),
-                     subtableDef->bytesize());
-        } else {
+        if (not subtableDef->is_struct()) {
           fbb.AddOffset(fieldDef->offset(),
                         Offset<void>(offsets[offsetIndex++]));
+        } else if (inPath) {
+          // The struct is rebuilt rather than copied: it is inline and has no
+          // vtable, so there is nothing to overwrite a single member of in
+          // place. `copyInline` reads the source unconditionally, which for a
+          // struct the buffer does not store reads a field that is not there.
+          const auto image =
+              buildStructImage(schema, subtableDef, fieldDef, sourceTable,
+                               fieldInSource, payload, updatePath(path));
+          if (image.has_value()) {
+            fbb.Align(subtableDef->minalign());
+            fbb.PushBytes(image->data(), image->size());
+            fbb.TrackField(fieldDef->offset(), fbb.GetSize());
+          } else if (fieldInSource) {
+            // A write that did not happen leaves the stored struct as it was.
+            copyInline(fbb, fieldDef, sourceTable, subtableDef->minalign(),
+                       subtableDef->bytesize());
+          }
+        } else {
+          copyInline(fbb, fieldDef, sourceTable, subtableDef->minalign(),
+                     subtableDef->bytesize());
         }
       }
       break;

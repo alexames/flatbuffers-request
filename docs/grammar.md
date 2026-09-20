@@ -17,9 +17,12 @@ value       = json-scalar | json-string | json-object | json-array ;
 ```
 
 `field-name` and `union-member` are identifiers from the target schema. `index`
-is a non-negative integer. `value` is parsed as JSON against the field's type
-(scalars and strings via a flexbuffer, tables/vectors via the FlatBuffers JSON
-parser).
+is a non-negative integer. `value` is parsed as JSON against the field's type:
+tables, union members and vectors of tables go through the FlatBuffers JSON
+parser, and everything else -- scalars, enums, strings, structs, and vectors
+and arrays of scalars -- through a flexbuffer. A payload of the wrong kind is
+refused rather than coerced, so an enum takes its ORDINAL and not its name: a
+name would read as 0.
 
 ## Paths
 
@@ -62,7 +65,9 @@ Intermediate objects along the path are created as needed, so
 
 Deleting an absent field or an element of an absent vector is a **no-op** (the
 buffer is returned unchanged). A field inside a struct cannot be removed
-individually — structs are indivisible, so such a delete is a no-op.
+individually — a struct has no way to record that a member is absent, so such a
+delete is a no-op. A `put` of a struct member does apply; see
+[design.md](design.md).
 
 ## patch
 
