@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-20
+
+### Fixed
+- A put into a stored union member kept the member's other fields. They were
+  read out of the table HOLDING the union, at the member's own field offsets,
+  which mean something else there or nothing: `put number.Fraction.numerator`
+  dropped `denominator` to 0. The member is now the source, and only while the
+  stored member is the one being written, so switching member carries nothing
+  across.
+
 ## [0.3.0] - 2026-07-05
 
 ### Added
