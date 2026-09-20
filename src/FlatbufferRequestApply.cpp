@@ -96,14 +96,6 @@ static const reflection::Object* getUnionTableDefFromEnumIndex(
   return schema->objects()->Get(unionType->index());
 }
 
-static const reflection::Object* getUnionTableDef(
-    const reflection::Schema* schema, const reflection::Object* tableDef,
-    const reflection::Field* fieldDef, const Table* sourceTable) {
-  const auto* unionType = getUnionTypeField(tableDef, fieldDef);
-  auto enumIndex = GetFieldI<uint8_t>(*sourceTable, *fieldDef);
-  return getUnionTableDefFromEnumIndex(schema, fieldDef, enumIndex);
-}
-
 static uoffset_t createString(flatbuffers::FlatBufferBuilder& fbb,
                               std::string_view str, bool useStringPooling) {
   return useStringPooling ? fbb.CreateSharedString(str).o
@@ -539,14 +531,29 @@ static uoffset_t applyRequestPut_GenerateVectorOffset(
 
 static uoffset_t applyRequestPut_GenerateUnionOffset(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
-    const reflection::Object* /*tableDef*/, const reflection::Field* fieldDef,
+    const reflection::Object* tableDef, const reflection::Field* fieldDef,
     const Table* sourceTable, std::span<const uint8_t> payload,
     std::span<const uint16_t> path, bool useStringPooling) {
   path = updatePath(path);
+  const auto requestedMember = static_cast<uint8_t>(path.front());
   const auto* subtableDef =
-      getUnionTableDefFromEnumIndex(schema, fieldDef, path.front());
+      getUnionTableDefFromEnumIndex(schema, fieldDef, requestedMember);
   path = updatePath(path);
-  return applyRequestPut(fbb, schema, subtableDef, sourceTable, payload, path,
+  // The MEMBER is what the member's own fields are copied from, and only
+  // while the stored member is the one being written. The table holding the
+  // union is not it: reading the member's fields out of the parent lands at
+  // the parent's offsets, which is another field or nothing at all. A request
+  // that switches member has nothing to copy, and must not carry the old
+  // member's bytes into the new one.
+  const Table* storedMember = nullptr;
+  if (sourceTable != nullptr) {
+    const auto* typeFieldDef = getUnionTypeField(tableDef, fieldDef);
+    if (typeFieldDef != nullptr
+        && GetFieldI<uint8_t>(*sourceTable, *typeFieldDef) == requestedMember) {
+      storedMember = GetFieldT(*sourceTable, *fieldDef);
+    }
+  }
+  return applyRequestPut(fbb, schema, subtableDef, storedMember, payload, path,
                          useStringPooling);
 }
 

@@ -112,7 +112,7 @@ if(FBREQUEST_BUILD_TESTS)
           PRIVATE
               "${CMAKE_CURRENT_SOURCE_DIR}/test/matchers"
       DEPENDENCIES
-          PUBLIC
+          PRIVATE
               FlatbuffersRequest
               TestSchemas
               flatbuffers::flatbuffers

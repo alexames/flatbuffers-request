@@ -177,6 +177,22 @@ INSTANTIATE_TEST_SUITE_P(
         TestArgs(R"({})", "put number.Integer.value 99",       R"({"number_type": "Integer", "number": {"value": 99}})"),
         TestArgs(R"({})", "put number.FloatingPoint.value 99", R"({"number_type": "FloatingPoint", "number": {"value": 99.0}})"),
 
+        // A put into a STORED union member keeps the member's other fields.
+        // The member's fields have to be copied out of the member, not out of
+        // the table holding the union.
+        TestArgs(R"({"number_type": "Fraction", "number": {"numerator": 3, "denominator": 4}})",
+                 "put number.Fraction.numerator 9",
+                 R"({"number_type": "Fraction", "number": {"numerator": 9, "denominator": 4}})"),
+        TestArgs(R"({"number_type": "Fraction", "number": {"numerator": 3, "denominator": 4}})",
+                 "put number.Fraction.denominator 9",
+                 R"({"number_type": "Fraction", "number": {"numerator": 3, "denominator": 9}})"),
+
+        // Switching member carries nothing across: the stored member is a
+        // source only while it is the member being written.
+        TestArgs(R"({"number_type": "Fraction", "number": {"numerator": 3, "denominator": 4}})",
+                 "put number.Integer.value 7",
+                 R"({"number_type": "Integer", "number": {"value": 7}})"),
+
         // Put non-scalar object on an empty table.
         TestArgs(R"({})", R"(put string "hello")",               R"({"string": "hello"})"),
         TestArgs(R"({})", R"(put object {"i32": 99})",           R"({"object": {"i32": 99}})"),

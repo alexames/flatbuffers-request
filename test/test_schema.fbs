@@ -24,9 +24,18 @@ table FloatingPoint {
   value: float32;
 }
 
+// Two fields, which is what makes a put into a stored member observable: a
+// request naming one of them must leave the other as it was.
+table Fraction {
+  numerator: int32;
+  denominator: int32;
+}
+
+// Appended, so the enum indices the golden files carry do not shift.
 union Number {
   Integer,
-  FloatingPoint
+  FloatingPoint,
+  Fraction
 }
 
 struct ScalarStruct {
