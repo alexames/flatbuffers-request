@@ -67,11 +67,14 @@ bool parseFlatbufferOffsetPath_ParseUnionName(
   return true;
 }
 
+// `writing` refuses the paths only a `put` cannot serve: a delete resolves
+// the same text and removes a whole element, which is well defined where
+// writing one is not.
 std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
     std::string_view* path, const reflection::Type** outType,
     const reflection::Object** outObject, bool* outElementInVector,
-    const reflection::Object* startObject = nullptr) {
+    const reflection::Object* startObject = nullptr, bool writing = false) {
   *outType = nullptr;
   // Paths inside a patch's nested operations are relative to the patched
   // subobject rather than the root table.
@@ -115,7 +118,14 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
           offsets.push_back(*arrayIndex);
           auto elementBaseType = field->type()->element();
           if (elementBaseType == reflection::Obj) {
-            *outObject = schema->objects()->Get(type->index());
+            const auto* elementDef = schema->objects()->Get(type->index());
+            if (writing and elementDef->is_struct()) {
+              // A struct element is inline, and nothing builds one: the apply
+              // generates no offset for it while the table builder still
+              // consumes one, which reads a neighbouring field's offset.
+              return std::nullopt;
+            }
+            *outObject = elementDef;
           } else if (elementBaseType == reflection::Union) {
             if (not parseFlatbufferOffsetPath_ParseUnionName(
                     schema, *field, path, &offsets, outObject)) {
@@ -125,13 +135,26 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
             *outObject = nullptr;
           }
         } else {
-          // Getting a path to the vector itself.
-          const auto userDefinedType = type->index() >= 0;
-          if (userDefinedType) {
-            *outObject = schema->objects()->Get(type->index());
-          } else {
-            *outObject = nullptr;
+          // Getting a path to the vector itself. Only a vector of TABLES
+          // names an object. `index` is set for a vector of enums and for a
+          // vector of unions too, where it names the ENUM, so reading it as
+          // an object index answers an unrelated object or runs off the end
+          // of the vector. A vector of unions has no whole-vector payload
+          // anyway: the types of its elements live in a second vector that a
+          // JSON array cannot carry.
+          const auto* elementDef =
+              (type->element() == reflection::Obj)
+                  ? schema->objects()->Get(type->index())
+                  : nullptr;
+          if (writing
+              and (type->element() == reflection::Union
+                   or (elementDef != nullptr and elementDef->is_struct()))) {
+            // A vector of unions has no whole-vector payload, and a vector of
+            // structs holds its elements inline with nothing to build one
+            // from. Neither is written here.
+            return std::nullopt;
           }
+          *outObject = elementDef;
         }
         break;
       }
@@ -213,12 +236,46 @@ std::optional<Offset<Put>> parseFlatbufferPut_ParseTable(
                                     parser.builder_.GetSize()));
 }
 
+// Whether a flexbuffer payload is the kind of value the field it is destined
+// for can hold. Only the mismatches apply can neither detect nor represent are
+// rejected: a string where a number belongs reads as 0, and a struct needs a
+// map to name its members by.
+bool payloadTypeAccepts(reflection::BaseType payloadType,
+                        flexbuffers::Reference value) {
+  switch (payloadType) {
+    case reflection::String:
+      return value.IsString();
+    case reflection::Obj:
+      // Reached only for a struct; a table is parsed against the schema.
+      return value.IsMap();
+    case reflection::Vector:
+    case reflection::Array:
+      return value.IsVector() or value.IsTypedVector();
+    case reflection::None:
+    case reflection::UType:
+    case reflection::Union:
+      return true;
+    default:
+      return not value.IsString() and not value.IsMap();
+  }
+}
+
 std::optional<Offset<Put>> parseFlatbufferPut_ParsePrimitive(
     FlatBufferBuilder& fbb, std::string_view* requestString,
-    Offset<Vector<uint16_t>>& offsets) {
+    Offset<Vector<uint16_t>>& offsets, reflection::BaseType payloadType) {
   auto parser = Parser{};
   if (not parser.ParseFlexBuffer(requestString->data(), nullptr,
                                  &parser.flex_builder_)) {
+    return std::nullopt;
+  }
+  // A scalar field takes a number. An enum is a scalar, and its NAME is not
+  // accepted: apply reads a string as a number, which answers 0 for every
+  // name, so accepting one here would write a wrong value rather than refuse
+  // a wrong request.
+  if (not payloadTypeAccepts(payloadType,
+                             flexbuffers::GetRoot(
+                                 parser.flex_builder_.GetBuffer().data(),
+                                 parser.flex_builder_.GetBuffer().size()))) {
     return std::nullopt;
   }
   // Advance past the parsed payload so a caller (e.g. a patch's update list)
@@ -238,25 +295,41 @@ std::optional<Offset<Put>> parseFlatbufferPut(
   bool elementInVector = false;
   auto offsets =
       parseFlatbufferOffsetPath(fbb, schema, requestString, &type, &typeObject,
-                                &elementInVector, startObject);
+                                &elementInVector, startObject, /*writing=*/true);
   if (not offsets) {
     return std::nullopt;
   }
-  assert(not elementInVector or type->base_type() == reflection::Vector);
+  assert(not elementInVector or type->base_type() == reflection::Vector
+         or type->base_type() == reflection::Array);
 
-  auto userDefinedType = type->index() >= 0;
-  if (userDefinedType) {
+  // Whether the payload needs parsing AGAINST the schema, which is exactly
+  // when the path resolved to an object: a table, a union member, or a vector
+  // of either. Reading `type->index()` instead would say yes for an
+  // enum-typed scalar as well, since its type names the enum -- and the path
+  // parser leaves no object for one, so the payload was handed to the table
+  // parser with nothing to parse against and the whole request was refused.
+  // Everything else, scalars and enums and vectors of them alike, is a
+  // flexbuffer payload.
+  if (typeObject != nullptr) {
     // NOLINTNEXTLINE(bugprone-branch-clone)
     if (type->base_type() == reflection::Vector and not elementInVector) {
       return parseFlatbufferPut_ParseVector(fbb, requestString, schema,
                                             typeObject, *offsets);
     }
-    return parseFlatbufferPut_ParseTable(fbb, requestString, schema, typeObject,
-                                         *offsets);
-
-  } else {
-    return parseFlatbufferPut_ParsePrimitive(fbb, requestString, *offsets);
+    if (not typeObject->is_struct()) {
+      return parseFlatbufferPut_ParseTable(fbb, requestString, schema,
+                                           typeObject, *offsets);
+    }
+    // A struct is carried as a flexbuffer map, not as a table: it has no
+    // vtable to build, and the apply writes its members into a fixed-size
+    // image by name. The table parser would need it as a root type, which a
+    // struct cannot be.
   }
+  // An element's payload is one of the element type; anything else is a
+  // payload of the field's own type, including a whole vector or array.
+  const auto payloadType = elementInVector ? type->element() : type->base_type();
+  return parseFlatbufferPut_ParsePrimitive(fbb, requestString, *offsets,
+                                           payloadType);
 }
 
 // Parses `<path> { <op> ; <op> ; ... }`, where each <op> is a put/patch/delete
