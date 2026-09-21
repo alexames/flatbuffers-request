@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(FlatbuffersRequest
-  VERSION 0.4.0
+  VERSION 0.4.1
   DESCRIPTION "Reflection-driven put/patch/delete requests for FlatBuffers"
   HOMEPAGE_URL "https://github.com/alexames/flatbuffers-request"
   LANGUAGES CXX)

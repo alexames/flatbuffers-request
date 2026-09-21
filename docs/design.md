@@ -46,7 +46,15 @@ payload into that image, and pushes it inline.
   leaving the elements the payload does not reach). An array cannot grow or
   shrink, so a payload longer than `N` writes nothing at all.
 - **A write that writes nothing leaves the field as it was**, including
-  leaving an absent struct absent rather than creating one of zeroes.
+  leaving an absent struct absent rather than creating one of zeroes. A map
+  naming no member the struct declares -- an empty one included -- writes
+  nothing, and so does an empty array payload. A map naming one known key
+  among unknown ones writes that one.
+- **A member whose payload the struct cannot take REFUSES the map it is in**,
+  rather than being skipped: a too-long array, a non-map for a nested struct,
+  or a value of the wrong kind for a scalar member. The distinction is between
+  a payload that asked for nothing, which is skipped, and one that asked for
+  something impossible, which is refused along with its siblings.
 
 A `put` is REFUSED, rather than served wrongly, for:
 

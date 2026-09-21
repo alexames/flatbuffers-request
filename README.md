@@ -10,7 +10,7 @@ patch player { put name "Aria" ; delete title }
 delete inventory[3]
 ```
 
-> Status: **v0.4.0**, extracted from the [Composer](https://github.com/alexames) engine's editor. Tables, vectors, unions, strings, scalars, enums and structs are supported, including fixed-size arrays inside a struct. Vectors of structs are not yet edited element-by-element.
+> Status: **v0.4.1**, extracted from the [Composer](https://github.com/alexames) engine's editor. Tables, vectors, unions, strings, scalars, enums and structs are supported, including fixed-size arrays inside a struct. Vectors of structs are not yet edited element-by-element.
 
 ## Install (vcpkg)
 
