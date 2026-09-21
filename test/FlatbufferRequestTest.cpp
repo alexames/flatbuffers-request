@@ -783,3 +783,120 @@ TEST_F(NestedStructTest, LeavesAnAbsentStructAbsentWhenAnArrayIsTooLong) {
   EXPECT_EQ(ts->scalars(), nullptr);
   EXPECT_EQ(ts->i32(), 10);
 }
+
+TEST_F(StructPutTest, LeavesAnAbsentStructAbsentWhenTheMapNamesNoMember) {
+  // The payload named nothing the struct declares, so nothing was written --
+  // and a request that writes nothing must not leave a struct of zeroes where
+  // the buffer had none.
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               R"(put scalars {"zzz": 1})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->i32(), 10);
+}
+
+TEST_F(StructPutTest, LeavesAStoredStructAloneWhenTheMapNamesNoMember) {
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
+  auto result = applyRequestTo(initial, R"(put scalars {"zzz": 1})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i8(), 2);
+  EXPECT_TRUE(ts->scalars()->b());
+}
+
+TEST_F(StructPutTest, LeavesAnAbsentStructAbsentForAnEmptyMap) {
+  // An empty map names no member either, so it writes nothing by the same
+  // rule. Creating a struct of zeroes for one would be the same surprise.
+  auto result =
+      applyRequestTo(GetBuffer(R"({"i32": 10})"), "put scalars {}");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->scalars(), nullptr);
+}
+
+TEST_F(StructPutTest, WritesTheMembersAMapDoesNameBesideOnesItDoesNot) {
+  // One known key is enough: the unknown ones are still ignored rather than
+  // refusing the whole request.
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
+  auto result =
+      applyRequestTo(initial, R"(put scalars {"zzz": 1, "i16": 40})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i16(), 40);
+  EXPECT_EQ(ts->scalars()->i8(), 2);
+}
+
+// A member whose payload writes nothing is SKIPPED, not a refusal of the
+// whole map: the members beside it were asked for and must still be written.
+TEST_F(NestedStructTest, WritesAMemberBesideOneWhosePayloadWritesNothing) {
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               R"(put nested {"inner": {}, "tail": 77})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->nested(), nullptr);
+  EXPECT_EQ(ts->nested()->tail(), 77);
+  EXPECT_EQ(ts->nested()->inner().a(), 0);
+}
+
+TEST_F(NestedStructTest, LeavesAnAbsentStructAbsentWhenOnlyNestedMapsAreEmpty) {
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               R"(put nested {"inner": {}})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->nested(), nullptr);
+  EXPECT_EQ(ts->i32(), 10);
+}
+
+TEST_F(StructPutTest, LeavesAnAbsentStructAbsentForAnEmptyArrayPayload) {
+  // An empty vector reaches no element, so it writes nothing -- the same rule
+  // as a map naming no member, one member kind over.
+  auto result =
+      applyRequestTo(GetBuffer(R"({"i32": 10})"), "put scalars.i32_array []");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->i32(), 10);
+}
+
+TEST_F(StructPutTest, LeavesAStoredArrayAloneForAnEmptyArrayPayload) {
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
+  auto result = applyRequestTo(initial, "put scalars.i32_array []");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i8(), 2);
+}
+
+// A member named in a MAP is the one place a wrong-kind value is not caught
+// by the request parser, which sees only the map and cannot tell which key
+// goes to which type. `writeScalarInto` converts whatever it is given: a
+// string reads as 0 or as the number it spells, and a vector reads as its
+// LENGTH, so an unchecked map writes a wrong value rather than refusing a
+// wrong request.
+TEST_F(StructPutTest, RefusesAWrongKindValueForAScalarMemberInAMap) {
+  auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
+  for (const auto* request : {R"(put scalars {"i8": [1,2,3]})",
+                              R"(put scalars {"i8": "hello"})",
+                              R"(put scalars {"i8": "7"})",
+                              R"(put scalars {"i8": {"q": 1}})"}) {
+    auto result = applyRequestTo(initial, request);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_NE(ts->scalars(), nullptr) << request;
+    EXPECT_EQ(ts->scalars()->i8(), 2) << request;
+  }
+}
+
+TEST_F(StructPutTest, DoesNotCreateAStructForAWrongKindValueInAMap) {
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               R"(put scalars {"i8": "hello"})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->scalars(), nullptr);
+}
+
+TEST_F(StructPutTest, StillTakesEveryScalarKindForAMemberInAMap) {
+  // The check must not refuse the kinds a scalar member does take.
+  auto result = applyRequestTo(
+      GetBuffer(R"({"i32": 10})"),
+      R"(put scalars {"b": true, "i8": 3, "f64": 1.5, "ui64": 9})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_TRUE(ts->scalars()->b());
+  EXPECT_EQ(ts->scalars()->i8(), 3);
+  EXPECT_DOUBLE_EQ(ts->scalars()->f64(), 1.5);
+  EXPECT_EQ(ts->scalars()->ui64(), 9U);
+}

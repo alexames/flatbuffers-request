@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-20
+
+### Fixed
+- A struct payload naming no member the struct declares still created the
+  struct. An unknown key is ignored rather than refusing the whole map, but
+  ignoring every key counted as a successful write, so `put scalars {"zzz": 1}`
+  against a buffer storing no `scalars` left one of zeroes behind. A map that
+  writes nothing -- an empty one included -- now leaves the field as it was,
+  which is what the surrounding code already documented. An empty ARRAY
+  payload counts the same way: `put scalars.i32_array []` reaches no element,
+  so it no longer creates the struct either.
+- A member of a struct named in a MAP took a value of the wrong kind. The
+  request parser sees only the map and cannot tell which key goes to which
+  type, and the writer converts whatever it is given -- so
+  `put scalars {"i8": [1,2,3]}` wrote 3, the vector's LENGTH, and
+  `{"i8": "hello"}` wrote 0. Both are refused now, as the same value already
+  was when named by its own path.
+
 ## [0.4.0] - 2026-09-20
 
 ### Fixed
@@ -96,7 +114,8 @@ Initial release, extracted from the Composer engine.
 
   (Both as of 0.1.0; see 0.4.0 for what arrays now accept.)
 
-[Unreleased]: https://github.com/alexames/flatbuffers-request/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/alexames/flatbuffers-request/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/alexames/flatbuffers-request/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/alexames/flatbuffers-request/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/alexames/flatbuffers-request/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/alexames/flatbuffers-request/compare/v0.2.0...v0.3.0

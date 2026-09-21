@@ -215,6 +215,15 @@ static const reflection::Field* structFieldAtOffset(
   return nullptr;
 }
 
+// Whether a flexbuffer value is the kind a scalar member can take. Anything
+// else -- a string, a map, a vector -- is converted rather than refused by
+// `writeScalarInto`, which answers a wrong number instead of a wrong request.
+static bool holdsAScalar(flexbuffers::Reference value) {
+  return not value.IsString() and not value.IsMap() and not value.IsVector()
+         and not value.IsTypedVector() and not value.IsFixedTypedVector()
+         and not value.IsBlob();
+}
+
 static void writeScalarInto(flexbuffers::Reference value,
                             reflection::BaseType type, std::span<uint8_t> at) {
   auto bytes = std::array<uint8_t, 8>{};
@@ -226,50 +235,71 @@ static void writeScalarInto(flexbuffers::Reference value,
   std::memcpy(at.data(), bytes.data(), size);
 }
 
-static bool writeStructMember(const reflection::Schema* schema,
-                              const reflection::Object* structDef,
-                              std::span<uint8_t> image,
-                              std::span<const uint16_t> path,
-                              flexbuffers::Reference value);
+// What writing a payload into a struct image came to. "Nothing" is not a
+// failure: a map naming no member the struct declares asked for nothing, and
+// the members BESIDE it are still written. It is only where nothing at all
+// was written that the caller leaves the field alone, so a payload that wrote
+// nothing does not create a struct of zeroes.
+enum class StructWrite { Rejected, Nothing, Wrote };
+
+static StructWrite writeStructMember(const reflection::Schema* schema,
+                                     const reflection::Object* structDef,
+                                     std::span<uint8_t> image,
+                                     std::span<const uint16_t> path,
+                                     flexbuffers::Reference value);
 
 // Writes every member `map` names into `image`, leaving the rest as they were.
-// A name the struct does not declare is ignored rather than refused: the
-// payload is parsed as a flexbuffer, which cannot be checked against the
-// schema until here, and a struct has no way to carry an unknown member.
-static bool writeStructMap(const reflection::Schema* schema,
-                           const reflection::Object* structDef,
-                           std::span<uint8_t> image, flexbuffers::Map map) {
+// A name the struct does not declare is ignored rather than refusing the whole
+// map: the payload is parsed as a flexbuffer, which cannot be checked against
+// the schema until here, and a struct has no way to carry an unknown member.
+//
+// Answers `Nothing` where it wrote nothing, so that a map naming no member
+// the struct declares -- an empty one included -- does not count as a write.
+// The caller leaves the field as it was, which is what keeps such a payload
+// from creating a struct of zeroes where the buffer had none. A member whose
+// own payload writes nothing is skipped; only a `Rejected` one, whose payload
+// the struct cannot take at all, refuses the map around it.
+static StructWrite writeStructMap(const reflection::Schema* schema,
+                                  const reflection::Object* structDef,
+                                  std::span<uint8_t> image,
+                                  flexbuffers::Map map) {
   auto keys = map.Keys();
   auto values = map.Values();
+  auto wroteAMember = false;
   for (size_t i = 0; i < keys.size(); i++) {
     const auto* fieldDef = structDef->fields()->LookupByKey(keys[i].AsKey());
     if (fieldDef == nullptr) {
       continue;
     }
     const auto memberOffset = fieldDef->offset();
-    if (not writeStructMember(schema, structDef, image,
-                              std::span{&memberOffset, 1}, values[i])) {
-      return false;
+    const auto written = writeStructMember(schema, structDef, image,
+                                           std::span{&memberOffset, 1},
+                                           values[i]);
+    if (written == StructWrite::Rejected) {
+      return StructWrite::Rejected;
     }
+    wroteAMember = wroteAMember or written == StructWrite::Wrote;
   }
-  return true;
+  return wroteAMember ? StructWrite::Wrote : StructWrite::Nothing;
 }
 
 // Writes `value` into the member `path` names, `path` being byte offsets into
 // successively nested structs and, for a fixed-length array, the element
 // index. An empty `path` means `value` is a map of the whole struct.
-static bool writeStructMember(const reflection::Schema* schema,
-                              const reflection::Object* structDef,
-                              std::span<uint8_t> image,
-                              std::span<const uint16_t> path,
-                              flexbuffers::Reference value) {
+static StructWrite writeStructMember(const reflection::Schema* schema,
+                                     const reflection::Object* structDef,
+                                     std::span<uint8_t> image,
+                                     std::span<const uint16_t> path,
+                                     flexbuffers::Reference value) {
   if (path.empty()) {
-    return value.IsMap() and writeStructMap(schema, structDef, image,
-                                            value.AsMap());
+    if (not value.IsMap()) {
+      return StructWrite::Rejected;
+    }
+    return writeStructMap(schema, structDef, image, value.AsMap());
   }
   const auto* fieldDef = structFieldAtOffset(structDef, path.front());
   if (fieldDef == nullptr or fieldDef->offset() >= image.size()) {
-    return false;
+    return StructWrite::Rejected;
   }
   auto at = image.subspan(fieldDef->offset());
   const auto baseType = fieldDef->type()->base_type();
@@ -286,7 +316,7 @@ static bool writeStructMember(const reflection::Schema* schema,
       // An array of structs: `GetTypeSize` answers a pointer's width for one,
       // not the struct's, so every element would be written at the wrong
       // stride. Nothing writes one, so nothing is written.
-      return false;
+      return StructWrite::Rejected;
     }
     const auto elementSize = GetTypeSize(elementType);
     const auto length = size_t{fieldDef->type()->fixed_length()};
@@ -295,37 +325,51 @@ static bool writeStructMember(const reflection::Schema* schema,
       // elements it does not reach; a longer one is refused, because a
       // fixed-length array cannot grow.
       if (not value.IsVector()) {
-        return false;
+        return StructWrite::Rejected;
       }
       auto elements = value.AsVector();
       if (elements.size() > length) {
-        return false;
+        return StructWrite::Rejected;
+      }
+      if (elements.size() == 0) {
+        // An empty vector reaches no element, so it writes nothing -- the
+        // same as a map naming no member, and not a reason to create a
+        // struct of zeroes.
+        return StructWrite::Nothing;
       }
       for (size_t i = 0; i < elements.size(); i++) {
         writeScalarInto(elements[static_cast<int>(i)], elementType,
                         at.subspan(i * elementSize));
       }
-      return true;
+      return StructWrite::Wrote;
     }
     const auto index = size_t{rest.front()};
     if (index >= length or rest.size() != 1) {
-      return false;
+      return StructWrite::Rejected;
     }
     writeScalarInto(value, elementType, at.subspan(index * elementSize));
-    return true;
+    return StructWrite::Wrote;
   }
   if (not rest.empty() or not IsScalar(baseType)) {
-    return false;
+    return StructWrite::Rejected;
+  }
+  if (not holdsAScalar(value)) {
+    // `writeScalarInto` converts whatever it is given: a string reads as 0 (or
+    // as the number it spells), and a vector reads as its LENGTH. A member
+    // named in a map has to be checked here, because the request parser sees
+    // only the map and cannot tell which key goes to which type.
+    return StructWrite::Rejected;
   }
   writeScalarInto(value, baseType, at);
-  return true;
+  return StructWrite::Wrote;
 }
 
 // The image of the struct `fieldDef` names after `payload` is written into it
 // at `path`: the source's bytes where the buffer stores one, zeroes where it
-// does not. Nothing where the payload names no member the struct can hold --
-// a fixed-length array too long for its field, say -- so that a request which
-// writes nothing does not leave a struct of zeroes where there was none.
+// does not. EMPTY where the payload wrote nothing, whether because the struct
+// cannot take it -- a fixed-length array too long for its field, say -- or
+// because it named nothing, so that a request which writes nothing does not
+// leave a struct of zeroes where there was none.
 static std::optional<std::vector<uint8_t>> buildStructImage(
     const reflection::Schema* schema, const reflection::Object* structDef,
     const reflection::Field* fieldDef, const Table* sourceTable,
@@ -340,7 +384,8 @@ static std::optional<std::vector<uint8_t>> buildStructImage(
     }
   }
   const auto value = flexbuffers::GetRoot(payload.data(), payload.size());
-  if (not writeStructMember(schema, structDef, image, path, value)) {
+  if (writeStructMember(schema, structDef, image, path, value)
+      != StructWrite::Wrote) {
     return std::nullopt;
   }
   return image;
