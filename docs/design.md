@@ -96,6 +96,12 @@ Consequences:
 Severing this coupling (depending only on the stable reflection API) is possible
 but a larger rework; it is intentionally deferred.
 
+Apply copies an unchanged sub-table with FlatBuffers' own `CopyTable`, which
+resolves a union through `GetUnionType` without checking that the stored
+discriminant names a table. A union stored with NONE or an undeclared
+discriminant is handled where apply copies it itself -- in the table a
+request edits -- but not inside a sub-table it hands to `CopyTable` whole.
+
 ## Layout
 
 ```

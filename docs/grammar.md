@@ -45,11 +45,14 @@ object) to a target field:
 - **Scalars / strings:** `put health 100`, `put name "Aria"`.
 - **Tables:** `put player {"level": 3, "name": "Aria"}` (JSON object).
 - **Union members:** `put number.Integer {"value": 9}` — sets both the union
-  value and its type discriminant.
+  value and its type discriminant. `NONE` holds no table, so a path naming it
+  (`put number.NONE {}`, `delete number.NONE`) is refused.
 - **Whole vectors:** `put scores [1, 2, 3]`, `put names ["a", "b"]`.
 - **Vector elements:** `put scores[4] 9`. Intermediate elements are created:
   scalar vectors zero-pad, string vectors pad with `""`, table/union vectors pad
-  with empty elements. Setting an out-of-range index grows the vector.
+  with empty elements (a union vector's padding is its first member). Setting
+  an out-of-range index grows the vector, and an element of a vector the
+  buffer does not store creates it, along with any table on the path to it.
 
 Intermediate objects along the path are created as needed, so
 `put a.b.c 1` on an empty table yields `{"a":{"b":{"c":1}}}`.
@@ -63,9 +66,11 @@ Intermediate objects along the path are created as needed, so
 - a single vector element (`delete scores[1]` — later elements shift down),
 - a field *inside* a sub-object, union member, or vector element.
 
-Deleting an absent field or an element of an absent vector is a **no-op** (the
-buffer is returned unchanged). A field inside a struct cannot be removed
-individually — a struct has no way to record that a member is absent, so such a
+Deleting an absent field, an element of an absent vector, or anything inside a
+table, union or struct the buffer does not store is a **no-op** (the buffer is
+returned unchanged; nothing is created on the way), and so is deleting a field
+of a union member other than the one stored. A field inside a struct cannot be
+removed individually — a struct has no way to record that a member is absent, so such a
 delete is a no-op. A `put` of a struct member does apply; see
 [design.md](design.md).
 
