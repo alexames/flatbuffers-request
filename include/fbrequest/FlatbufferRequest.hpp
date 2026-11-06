@@ -21,6 +21,7 @@ flatbuffers::Offset<const flatbuffers::Table*> copyTable(
 
 // Parses a textual request (`put` / `patch` / `delete`) against `schema` into a
 // serialized Request buffer. Returns nullopt when the request is malformed.
+// Only the bytes `requestString` views are read; it need not be terminated.
 // Read the result with
 // flatbuffers::GetRoot<serialized::Request>(buffer.data()).
 std::optional<ByteBuffer> parseFlatbufferRequest(

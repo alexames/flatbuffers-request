@@ -1,5 +1,6 @@
 #include <optional>
 #include <span>
+#include <string>
 
 #include "StringScan.hpp"
 #include "fbrequest/FlatbufferRequest.hpp"
@@ -462,6 +463,10 @@ std::optional<Operation> parseFlatbufferOperationEnum(
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 std::optional<fbrequest::ByteBuffer> fbrequest::parseFlatbufferRequest(
     const reflection::Schema* schema, std::string_view requestString) {
+  // The flatbuffers JSON and flexbuffer parsers take a C string and read to
+  // its terminator, which a view does not promise; this copy supplies one.
+  const auto terminated = std::string{requestString};
+  requestString = terminated;
   auto operation = parseFlatbufferOperationEnum(&requestString);
   if (not operation) {
     return std::nullopt;

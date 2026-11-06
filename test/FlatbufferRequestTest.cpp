@@ -3,6 +3,8 @@
 #include <iostream>
 #include <ranges>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "fbrequest/FlatbufferRequest.hpp"
@@ -477,7 +479,7 @@ class BufferRequestTest : public ::testing::Test {
   /// Applies `request` to `initial` and verifies the result, so a test that
   /// reads a field off the answer is reading a buffer known to be well formed.
   flatbuffers::DetachedBuffer applyRequestTo(
-      const std::vector<uint8_t>& initial, const char* request) {
+      const std::vector<uint8_t>& initial, std::string_view request) {
     flatbuffers::FlatBufferBuilder fbb;
     auto parsed = parseFlatbufferRequest(schema_, request);
     EXPECT_TRUE(parsed.has_value()) << request;
@@ -791,6 +793,31 @@ TEST_F(PayloadAlignmentTest, ReadsEveryTableOfAVectorPayload) {
     EXPECT_EQ(vector->Get(2)->i8(), 2) << shift;
     EXPECT_EQ(vector->Get(2)->f64(), 0.1) << shift;
   }
+}
+
+class UnterminatedRequestTest : public BufferRequestTest {};
+
+// Each view stops short of text that, read on to the terminator, would parse
+// to something else.
+TEST_F(UnterminatedRequestTest, ParsesOnlyTheViewOfAScalarPut) {
+  const auto text = std::string_view{"put i32 12"};
+  auto result = applyRequestTo(GetBuffer("{}"), text.substr(0, 9));
+  EXPECT_EQ(matcher_test::GetTestSchema(result.data())->i32(), 1);
+}
+
+TEST_F(UnterminatedRequestTest, RefusesATablePutTheViewCutsShort) {
+  const auto text = std::string_view{R"(put object {"i32": 7})"};
+  EXPECT_FALSE(parseFlatbufferRequest(schema_, text.substr(0, text.size() - 1))
+                   .has_value());
+}
+
+TEST_F(UnterminatedRequestTest, ReadsNoFurtherThanAHeapViewEnds) {
+  // Sized exactly, so ASan reports a read past the view's last byte.
+  const auto text = std::string_view{"put i8 [1"};
+  const auto bytes = std::vector<char>(text.begin(), text.end());
+  EXPECT_FALSE(parseFlatbufferRequest(
+                   schema_, std::string_view{bytes.data(), bytes.size()})
+                   .has_value());
 }
 
 class NestedStructTest : public BufferRequestTest {};
