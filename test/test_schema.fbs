@@ -49,6 +49,15 @@ enum Color : ubyte {
   Blue,
 }
 
+// A union whose members' values are not their positions among its values:
+// Fraction is value 2 at position 1, and Integer value 5 at position 2. A
+// reader indexing the values by a member's value reads the wrong member, or
+// none, and padding that assumes the first member is 1 writes no member.
+union Sparse {
+  Fraction = 2,
+  Integer = 5
+}
+
 struct ScalarStruct {
   b: bool;
   i8: int8;
@@ -119,6 +128,8 @@ table TestSchema {
   color: Color;
   color_vector: [Color];
   nested: Nested;
+  sparse: Sparse;
+  sparse_vector: [Sparse];
 }
 
 root_type TestSchema;

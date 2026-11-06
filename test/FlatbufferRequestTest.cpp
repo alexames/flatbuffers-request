@@ -794,13 +794,24 @@ TEST_F(RefusedPutTest, RefusesAWholeVectorOfUnions) {
 class HandBuiltTest : public BufferRequestTest {
  protected:
   flatbuffers::DetachedBuffer applyPut(const std::vector<uint8_t>& initial,
-                                       const std::vector<uint16_t>& path) {
+                                       const std::vector<uint32_t>& path) {
     flatbuffers::FlatBufferBuilder requestBuilder;
     const auto payload = std::vector<uint8_t>{};
     requestBuilder.Finish(serialized::CreateRequest(
         requestBuilder, serialized::Operation::Put,
         serialized::CreatePut(requestBuilder, requestBuilder.CreateVector(path),
                               requestBuilder.CreateVector(payload))
+            .Union()));
+    return apply(initial, requestBuilder.GetBufferPointer());
+  }
+
+  flatbuffers::DetachedBuffer applyDelete(const std::vector<uint8_t>& initial,
+                                          const std::vector<uint32_t>& path) {
+    flatbuffers::FlatBufferBuilder requestBuilder;
+    requestBuilder.Finish(serialized::CreateRequest(
+        requestBuilder, serialized::Operation::Delete,
+        serialized::CreateDelete(requestBuilder,
+                                 requestBuilder.CreateVector(path))
             .Union()));
     return apply(initial, requestBuilder.GetBufferPointer());
   }
@@ -870,9 +881,9 @@ TEST_F(HandBuiltTest, WritesNoUnionMemberForNone) {
   const auto initial =
       GetBuffer(R"({"string": "kept", "object": {"i8": 3}, "i32": 7})");
   for (const auto& path :
-       {std::vector<uint16_t>{fieldOffset("number"), kNone},
-        std::vector<uint16_t>{fieldOffset("number"), kUndeclared},
-        std::vector<uint16_t>{fieldOffset("number"), kNone, 4}}) {
+       {std::vector<uint32_t>{fieldOffset("number"), kNone},
+        std::vector<uint32_t>{fieldOffset("number"), kUndeclared},
+        std::vector<uint32_t>{fieldOffset("number"), kNone, 4}}) {
     auto result = applyPut(initial, path);
     const auto* ts = matcher_test::GetTestSchema(result.data());
     EXPECT_EQ(ts->number_type(), matcher_test::Number::NONE);
@@ -884,8 +895,8 @@ TEST_F(HandBuiltTest, WritesNoUnionMemberForNone) {
 TEST_F(HandBuiltTest, KeepsAStoredUnionAPutNamingNoTableCannotWrite) {
   const auto initial = withUnion(kInteger);
   for (const auto& path :
-       {std::vector<uint16_t>{fieldOffset("number"), kNone},
-        std::vector<uint16_t>{fieldOffset("number"), kUndeclared, 4}}) {
+       {std::vector<uint32_t>{fieldOffset("number"), kNone},
+        std::vector<uint32_t>{fieldOffset("number"), kUndeclared, 4}}) {
     auto result = applyPut(initial, path);
     const auto* ts = matcher_test::GetTestSchema(result.data());
     ASSERT_EQ(ts->number_type(), matcher_test::Number::Integer);
@@ -1183,4 +1194,496 @@ TEST_F(StructPutTest, StillTakesEveryScalarKindForAMemberInAMap) {
   EXPECT_EQ(ts->scalars()->i8(), 3);
   EXPECT_DOUBLE_EQ(ts->scalars()->f64(), 1.5);
   EXPECT_EQ(ts->scalars()->ui64(), 9U);
+}
+
+// A path is resolved to the field, element or member its text names, or the
+// request is refused: never to another element or member, nor to a field the
+// apply does not write.
+class PathResolutionTest : public BufferRequestTest {
+ protected:
+  bool parses(std::string_view request) {
+    return parseFlatbufferRequest(schema_, request).has_value();
+  }
+
+  /// A buffer storing `i32` as 7 and `i32_vector` as 0, 1, ..., `size` - 1.
+  ///
+  /// @param size Number of elements in the vector.
+  std::vector<uint8_t> withCountingVector(size_t size) {
+    auto json = std::string{R"({"i32": 7, "i32_vector": [)"};
+    for (size_t i = 0; i < size; i++) {
+      json += (i == 0 ? "" : ",") + std::to_string(i);
+    }
+    return GetBuffer(json + "]}");
+  }
+};
+
+TEST_F(PathResolutionTest, PutsAnElementAboveSixteenBits) {
+  auto result = applyRequestTo(GetBuffer(R"({"i32_vector": [1, 2]})"),
+                               "put i32_vector[70000] 5");
+  const auto* vector = matcher_test::GetTestSchema(result.data())->i32_vector();
+  ASSERT_NE(vector, nullptr);
+  ASSERT_EQ(vector->size(), 70001U);
+  EXPECT_EQ(vector->Get(70000), 5);
+  // 70000 truncated to 16 bits, which must stay untouched.
+  EXPECT_EQ(vector->Get(4464), 0);
+  EXPECT_EQ(vector->Get(1), 2);
+}
+
+TEST_F(PathResolutionTest, PutsAFieldOfAnElementAboveSixteenBits) {
+  auto result =
+      applyRequestTo(GetBuffer("{}"), "put object_vector[65537].i8 9");
+  const auto* vector =
+      matcher_test::GetTestSchema(result.data())->object_vector();
+  ASSERT_NE(vector, nullptr);
+  ASSERT_EQ(vector->size(), 65538U);
+  EXPECT_EQ(vector->Get(65537)->i8(), 9);
+  EXPECT_EQ(vector->Get(1)->i8(), 0);
+}
+
+TEST_F(PathResolutionTest, DeletesAnElementAboveSixteenBits) {
+  auto result =
+      applyRequestTo(withCountingVector(65540), "delete i32_vector[65537]");
+  const auto* vector = matcher_test::GetTestSchema(result.data())->i32_vector();
+  ASSERT_NE(vector, nullptr);
+  ASSERT_EQ(vector->size(), 65539U);
+  EXPECT_EQ(vector->Get(1), 1);
+  EXPECT_EQ(vector->Get(65536), 65536);
+  EXPECT_EQ(vector->Get(65537), 65538);
+}
+
+TEST_F(PathResolutionTest, RefusesAnIndexThatIsNotANonNegativeInteger) {
+  // Unsigned, or a negative index would wrap to the top of the range.
+  EXPECT_FALSE(parses("put i32_vector[-1] 5"));
+  EXPECT_FALSE(parses("delete i32_vector[-1]"));
+  EXPECT_FALSE(parses("put i32_vector[+1] 5"));
+  EXPECT_FALSE(parses("put i32_vector[] 5"));
+  EXPECT_FALSE(parses("put i32_vector[4294967296] 5"));
+}
+
+TEST_F(PathResolutionTest, RefusesAPutGrowingAVectorPastWhatAFlatbufferHolds) {
+  // Each vector would need more bytes than a flatbuffer can address.
+  EXPECT_FALSE(parses("put i32_vector[600000000] 5"));
+  EXPECT_FALSE(parses(R"(put string_vector[200000000] "a")"));
+  EXPECT_FALSE(parses("put object_vector[4000000000].i8 1"));
+  // Exactly the most a flatbuffer holds as four-byte elements, with no room
+  // for the table around them.
+  EXPECT_FALSE(parses("put i32_vector[536870910] 5"));
+  EXPECT_TRUE(parses("put i32_vector[100000000] 5"));
+  // Removing one asks for nothing to be built.
+  EXPECT_TRUE(parses("delete i32_vector[4000000000]"));
+}
+
+TEST_F(PathResolutionTest, PutsASparseUnionMember) {
+  auto result =
+      applyRequestTo(GetBuffer("{}"), R"(put sparse.Integer {"value": 9})");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_EQ(ts->sparse_type(), matcher_test::Sparse::Integer);
+  ASSERT_NE(ts->sparse_as_Integer(), nullptr);
+  EXPECT_EQ(ts->sparse_as_Integer()->value(), 9);
+}
+
+TEST_F(PathResolutionTest, PutsAFieldOfAStoredSparseUnionMember) {
+  auto result =
+      applyRequestTo(GetBuffer(R"({"sparse_type": "Fraction", "sparse": )"
+                               R"({"numerator": 1, "denominator": 2}})"),
+                     "put sparse.Fraction.denominator 4");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_EQ(ts->sparse_type(), matcher_test::Sparse::Fraction);
+  ASSERT_NE(ts->sparse_as_Fraction(), nullptr);
+  EXPECT_EQ(ts->sparse_as_Fraction()->numerator(), 1);
+  EXPECT_EQ(ts->sparse_as_Fraction()->denominator(), 4);
+}
+
+TEST_F(PathResolutionTest, SwitchesASparseUnionMember) {
+  auto result =
+      applyRequestTo(GetBuffer(R"({"sparse_type": "Fraction", "sparse": )"
+                               R"({"numerator": 1, "denominator": 2}})"),
+                     "put sparse.Integer.value 9");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_EQ(ts->sparse_type(), matcher_test::Sparse::Integer);
+  ASSERT_NE(ts->sparse_as_Integer(), nullptr);
+  EXPECT_EQ(ts->sparse_as_Integer()->value(), 9);
+}
+
+TEST_F(PathResolutionTest, DeletesThroughASparseUnionMember) {
+  const auto initial = GetBuffer(R"({"i32": 7, "sparse_type": "Fraction", )"
+                                 R"("sparse": {"numerator": 1, )"
+                                 R"("denominator": 2}})");
+  auto result = applyRequestTo(initial, "delete sparse.Fraction.numerator");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_EQ(ts->sparse_type(), matcher_test::Sparse::Fraction);
+  ASSERT_NE(ts->sparse_as_Fraction(), nullptr);
+  EXPECT_EQ(ts->sparse_as_Fraction()->numerator(), 0);
+  EXPECT_EQ(ts->sparse_as_Fraction()->denominator(), 2);
+
+  result = applyRequestTo(initial, "delete sparse.Fraction");
+  ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->sparse_type(), matcher_test::Sparse::NONE);
+  EXPECT_EQ(ts->sparse(), nullptr);
+  EXPECT_EQ(ts->i32(), 7);
+}
+
+TEST_F(PathResolutionTest, PadsASparseUnionVectorWithItsFirstMember) {
+  auto result =
+      applyRequestTo(GetBuffer("{}"), "put sparse_vector[1].Integer.value 7");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->sparse_vector_type(), nullptr);
+  ASSERT_NE(ts->sparse_vector(), nullptr);
+  ASSERT_EQ(ts->sparse_vector_type()->size(), 2U);
+  EXPECT_EQ(ts->sparse_vector_type()->Get(0), matcher_test::Sparse::Fraction);
+  EXPECT_EQ(ts->sparse_vector_type()->Get(1), matcher_test::Sparse::Integer);
+  EXPECT_EQ(ts->sparse_vector()->GetAs<matcher_test::Integer>(1)->value(), 7);
+}
+
+TEST_F(PathResolutionTest, EditsAndDeletesSparseUnionVectorElements) {
+  const auto initial =
+      GetBuffer(R"({"sparse_vector_type": ["Integer", "Fraction"], )"
+                R"("sparse_vector": [{"value": 1}, )"
+                R"({"numerator": 3, "denominator": 4}]})");
+  auto result =
+      applyRequestTo(initial, "put sparse_vector[1].Fraction.numerator 8");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_EQ(ts->sparse_vector_type()->Get(1), matcher_test::Sparse::Fraction);
+  EXPECT_EQ(ts->sparse_vector()->GetAs<matcher_test::Fraction>(1)->numerator(),
+            8);
+  EXPECT_EQ(
+      ts->sparse_vector()->GetAs<matcher_test::Fraction>(1)->denominator(), 4);
+  EXPECT_EQ(ts->sparse_vector()->GetAs<matcher_test::Integer>(0)->value(), 1);
+
+  result = applyRequestTo(initial, "delete sparse_vector[0].Integer.value");
+  ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_EQ(ts->sparse_vector_type()->Get(0), matcher_test::Sparse::Integer);
+  EXPECT_EQ(ts->sparse_vector()->GetAs<matcher_test::Integer>(0)->value(), 0);
+
+  result = applyRequestTo(initial, "delete sparse_vector[0].Integer");
+  ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_EQ(ts->sparse_vector_type()->size(), 1U);
+  ASSERT_EQ(ts->sparse_vector()->size(), 1U);
+  EXPECT_EQ(ts->sparse_vector_type()->Get(0), matcher_test::Sparse::Fraction);
+  EXPECT_EQ(ts->sparse_vector()->GetAs<matcher_test::Fraction>(0)->numerator(),
+            3);
+}
+
+TEST_F(PathResolutionTest, RefusesAPathNamingADiscriminator) {
+  // A union's discriminator is written only from the union beside it, so a
+  // request naming one would write nothing.
+  EXPECT_FALSE(parses("put number_type 2"));
+  EXPECT_FALSE(parses("put number_vector_type [1]"));
+  EXPECT_FALSE(parses("put number_vector_type[0] 2"));
+  EXPECT_FALSE(parses("delete number_type"));
+  EXPECT_FALSE(parses("delete number_vector_type"));
+  EXPECT_FALSE(parses("delete number_vector_type[0]"));
+  EXPECT_FALSE(parses("put object.number_type 2"));
+  EXPECT_FALSE(parses("patch { put number_type 1 }"));
+  EXPECT_FALSE(parses("patch object { delete number_type }"));
+}
+
+TEST_F(PathResolutionTest, RefusesAPutOrPatchStoppingAtAUnion) {
+  // Nothing says which member a payload is.
+  EXPECT_FALSE(parses(R"(put number {"value": 1})"));
+  EXPECT_FALSE(parses(R"(put number_vector[0] {"value": 1})"));
+  EXPECT_FALSE(parses("patch number { put value 1 }"));
+  EXPECT_FALSE(parses("patch number_vector[0] { put value 1 }"));
+}
+
+TEST_F(PathResolutionTest, DeletesAWholeUnion) {
+  const auto initial = GetBuffer(
+      R"({"i32": 7, "number_type": "Integer", "number": {"value": 5}})");
+  auto result = applyRequestTo(initial, "delete number");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->number_type(), matcher_test::Number::NONE);
+  EXPECT_EQ(ts->number(), nullptr);
+  EXPECT_EQ(ts->i32(), 7);
+
+  result = applyRequestTo(GetBuffer(R"({"i32": 7})"), "delete number");
+  ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->number(), nullptr);
+  EXPECT_EQ(ts->i32(), 7);
+}
+
+TEST_F(PathResolutionTest, DeletesAWholeUnionVectorElement) {
+  auto result = applyRequestTo(
+      GetBuffer(R"({"number_vector_type": ["Integer", "Fraction"], )"
+                R"("number_vector": [{"value": 1}, {"numerator": 3}]})"),
+      "delete number_vector[0]");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->number_vector_type(), nullptr);
+  ASSERT_EQ(ts->number_vector_type()->size(), 1U);
+  ASSERT_EQ(ts->number_vector()->size(), 1U);
+  EXPECT_EQ(ts->number_vector_type()->Get(0), matcher_test::Number::Fraction);
+  EXPECT_EQ(ts->number_vector()->GetAs<matcher_test::Fraction>(0)->numerator(),
+            3);
+}
+
+TEST_F(PathResolutionTest, KeepsAUnionADeleteNamesAnotherMemberOf) {
+  // The text names a Fraction the buffer does not hold, so there is nothing
+  // to remove; the Integer it does hold is not it.
+  const auto initial = GetBuffer(
+      R"({"number_type": "Integer", "number": {"value": 5}, )"
+      R"("number_vector_type": ["Integer"], "number_vector": [{"value": 6}]})");
+  for (const auto* request :
+       {"delete number.Fraction", "delete number.Fraction.numerator",
+        "delete number_vector[0].Fraction",
+        "delete number_vector[0].Fraction.numerator"}) {
+    auto result = applyRequestTo(initial, request);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_EQ(ts->number_type(), matcher_test::Number::Integer) << request;
+    EXPECT_EQ(ts->number_as_Integer()->value(), 5) << request;
+    ASSERT_NE(ts->number_vector(), nullptr) << request;
+    ASSERT_EQ(ts->number_vector()->size(), 1U) << request;
+    ASSERT_EQ(ts->number_vector_type()->size(), 1U) << request;
+    EXPECT_EQ(ts->number_vector()->GetAs<matcher_test::Integer>(0)->value(), 6)
+        << request;
+  }
+}
+
+TEST_F(PathResolutionTest, RefusesAnIndexPastAFixedLengthArray) {
+  // An array cannot grow, so the element named does not exist.
+  EXPECT_FALSE(parses("put scalars.i32_array[10] 1"));
+  EXPECT_FALSE(parses("put scalars.i32_array[99] 1"));
+  EXPECT_FALSE(parses("put nested.inner.arr[3] 1"));
+  EXPECT_FALSE(parses("delete scalars.i32_array[99]"));
+  EXPECT_FALSE(parses("delete nested.structs[2]"));
+  EXPECT_TRUE(parses("put scalars.i32_array[9] 1"));
+}
+
+TEST_F(PathResolutionTest, RefusesAnElementOfAnArrayOfStructs) {
+  EXPECT_FALSE(parses("put nested.structs[0].a 2"));
+  EXPECT_FALSE(parses(R"(put nested.structs[0] {"a": 2})"));
+  EXPECT_FALSE(parses(R"(put nested.structs [{"a": 2}])"));
+}
+
+TEST_F(PathResolutionTest, RefusesAPathContinuingPastAWholeVector) {
+  // A whole vector of tables or structs names its element type for the
+  // payload, but a field after it would be read as an element index.
+  EXPECT_FALSE(parses("put object_vector.i8 5"));
+  EXPECT_FALSE(parses("delete object_vector.i8"));
+  EXPECT_FALSE(parses("delete struct_vector.i8"));
+  EXPECT_TRUE(parses("delete object_vector[0].i8"));
+}
+
+TEST_F(PathResolutionTest, KeepsAnArrayOfStructsADeleteNamesAnElementOf) {
+  // An element of an array is inside a struct, which cannot lose one.
+  const auto initial =
+      GetBuffer(R"({"nested": {"inner": {"a": 1, "arr": [0,0,0]},)"
+                R"( "structs": [{"a": 8, "arr": [0,0,0]},)"
+                R"( {"a": 9, "arr": [0,0,0]}], "tail": 3}})");
+  for (const auto* request :
+       {"delete nested.structs[1]", "delete nested.structs[1].a"}) {
+    auto result = applyRequestTo(initial, request);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_NE(ts->nested(), nullptr) << request;
+    EXPECT_EQ(ts->nested()->structs()->Get(0)->a(), 8) << request;
+    EXPECT_EQ(ts->nested()->structs()->Get(1)->a(), 9) << request;
+    EXPECT_EQ(ts->nested()->tail(), 3) << request;
+  }
+}
+
+TEST_F(PathResolutionTest, RefusesAnIndexIntoWhatIsNotAVectorOrArray) {
+  // A bracket left after the path would be parsed as the payload.
+  EXPECT_FALSE(parses("put i8[0] 1"));
+  EXPECT_FALSE(parses("delete i8[0]"));
+  EXPECT_FALSE(parses("put i32_vector[0][1] 5"));
+  EXPECT_FALSE(parses("put object[0].i8 5"));
+}
+
+TEST_F(PathResolutionTest, RefusesTextAfterTheRequest) {
+  // Only the first operation is applied, so anything after it is refused.
+  EXPECT_FALSE(parses("delete i8 i16"));
+  EXPECT_FALSE(parses("put i8 5 6"));
+  EXPECT_FALSE(parses("patch { put i8 1 } delete i16"));
+  EXPECT_TRUE(parses("delete i8 "));
+  EXPECT_TRUE(parses("put i8 5\n"));
+}
+
+// A union may hold a struct in a schema generated for C++ alone. The apply
+// reads every member as a table, so a path into one is refused.
+TEST(UnionStructMemberTest, RefusesAPathIntoAStructMember) {
+  auto options = flatbuffers::IDLOptions{};
+  options.lang_to_generate = flatbuffers::IDLOptions::kCpp;
+  flatbuffers::Parser parser{options};
+  ASSERT_TRUE(parser.Parse(R"fbs(
+    table T { x: int32; }
+    struct S { a: int32; }
+    union U { T, S }
+    table Root { u: U; }
+    root_type Root;
+  )fbs"))
+      << parser.error_;
+  parser.Serialize();
+  const auto* schema =
+      reflection::GetSchema(parser.builder_.GetBufferPointer());
+  EXPECT_FALSE(parseFlatbufferRequest(schema, R"(put u.S {"a": 1})"));
+  EXPECT_FALSE(parseFlatbufferRequest(schema, "put u.S.a 1"));
+  EXPECT_FALSE(parseFlatbufferRequest(schema, "delete u.S.a"));
+  EXPECT_TRUE(parseFlatbufferRequest(schema, "put u.T.x 1"));
+  EXPECT_TRUE(parseFlatbufferRequest(schema, "delete u"));
+}
+
+// A stored struct member is copied as its bytes, not read as a table.
+TEST(UnionStructMemberTest, KeepsAStoredStructMember) {
+  auto options = flatbuffers::IDLOptions{};
+  options.lang_to_generate = flatbuffers::IDLOptions::kCpp;
+  flatbuffers::Parser parser{options};
+  ASSERT_TRUE(parser.Parse(R"fbs(
+    table T { x: int32; }
+    struct S { a: int32; b: int64; }
+    union U { T, S }
+    table Root { u: U; i: int32; us: [U]; }
+    root_type Root;
+  )fbs"))
+      << parser.error_;
+  parser.Serialize();
+  const auto bfbs = std::vector<uint8_t>(
+      parser.builder_.GetBufferPointer(),
+      parser.builder_.GetBufferPointer() + parser.builder_.GetSize());
+  const auto* schema = reflection::GetSchema(bfbs.data());
+  ASSERT_TRUE(parser.Parse(
+      R"json({"u_type": "S", "u": {"a": 5, "b": 6}, "i": 1,
+              "us_type": ["S", "T"], "us": [{"a": 7, "b": 8}, {"x": 9}]})json"))
+      << parser.error_;
+  const auto initial = std::vector<uint8_t>(
+      parser.builder_.GetBufferPointer(),
+      parser.builder_.GetBufferPointer() + parser.builder_.GetSize());
+
+  for (const auto* text : {"put i 2", "delete i", "delete us[1].T.x"}) {
+    auto request = parseFlatbufferRequest(schema, text);
+    ASSERT_TRUE(request.has_value()) << text;
+    flatbuffers::FlatBufferBuilder fbb;
+    fbb.Finish(applyRequest(
+        fbb, schema, flatbuffers::GetAnyRoot(initial.data()),
+        flatbuffers::GetRoot<serialized::Request>(request->data())));
+    const auto& root = *flatbuffers::GetAnyRoot(fbb.GetBufferPointer());
+    const auto* rootDef = schema->root_table();
+    const auto* u = rootDef->fields()->LookupByKey("u");
+    const auto* member = flatbuffers::GetFieldT(root, *u);
+    ASSERT_NE(member, nullptr) << text;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(member);
+    int32_t a = 0;
+    int64_t b = 0;
+    std::memcpy(&a, bytes, sizeof(a));
+    std::memcpy(&b, bytes + 8, sizeof(b));
+    EXPECT_EQ(a, 5) << text;
+    EXPECT_EQ(b, 6) << text;
+
+    const auto* us = rootDef->fields()->LookupByKey("us");
+    const auto* elements = flatbuffers::GetFieldAnyV(root, *us);
+    ASSERT_NE(elements, nullptr) << text;
+    ASSERT_EQ(elements->size(), 2U) << text;
+    const auto* first = reinterpret_cast<const uint8_t*>(
+        flatbuffers::GetAnyVectorElemPointer<const flatbuffers::Table>(elements,
+                                                                       0));
+    std::memcpy(&a, first, sizeof(a));
+    std::memcpy(&b, first + 8, sizeof(b));
+    EXPECT_EQ(a, 7) << text;
+    EXPECT_EQ(b, 8) << text;
+  }
+}
+
+TEST_F(PathResolutionTest, KeepsAStructVectorElementADeleteNamesAMemberOf) {
+  // A struct cannot lose a member, so the delete is a no-op, as for a struct
+  // field, and leaves the element it names.
+  auto initial = GetBuffer(std::string(R"({"struct_vector": [)") + kStructA
+                           + "," + kStructB + "]}");
+  auto result = applyRequestTo(initial, "delete struct_vector[0].i8");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->struct_vector(), nullptr);
+  ASSERT_EQ(ts->struct_vector()->size(), 2U);
+  EXPECT_EQ(ts->struct_vector()->Get(0)->i8(), 1);
+  EXPECT_EQ(ts->struct_vector()->Get(1)->i8(), 2);
+}
+
+TEST_F(PathResolutionTest, RefusesAPatchOfWhatAPutCannotWrite) {
+  // A patch's operations are puts as well as deletes, and its path is the
+  // prefix of theirs, so it takes only a path a put could: one stopping at a
+  // whole vector would have each operation's first step read as an index.
+  EXPECT_FALSE(parses("patch struct_vector { put i8 1 }"));
+  EXPECT_FALSE(parses("patch object_vector { put i8 1 }"));
+  EXPECT_FALSE(parses("patch object_vector { delete i8 }"));
+  EXPECT_FALSE(parses("patch struct_vector[0] { put i8 1 }"));
+  EXPECT_FALSE(parses("patch object_vector[4000000000] { put i8 1 }"));
+  EXPECT_TRUE(parses("patch object_vector[3] { put i8 1 }"));
+}
+
+TEST_F(HandBuiltTest, WritesNothingForAMemberPastADiscriminantsRange) {
+  // 257 truncated to a discriminant's 8 bits would be Integer.
+  const auto initial =
+      GetBuffer(R"({"string": "kept", "object": {"i8": 3}, "i32": 7})");
+  auto result = applyPut(initial, {fieldOffset("number"), 256U + kInteger});
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->number_type(), matcher_test::Number::NONE);
+  EXPECT_EQ(ts->number(), nullptr);
+  expectSiblingsKept(ts);
+}
+
+TEST_F(HandBuiltTest, WritesNothingForAPathStoppingAtAUnion) {
+  const auto initial = withUnion(kInteger);
+  for (const auto& path :
+       {std::vector<uint32_t>{fieldOffset("number")},
+        std::vector<uint32_t>{fieldOffset("number_vector"), 0}}) {
+    auto result = applyPut(initial, path);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_EQ(ts->number_type(), matcher_test::Number::Integer);
+    EXPECT_EQ(ts->number_as_Integer()->value(), 3);
+    EXPECT_EQ(ts->number_vector(), nullptr);
+    expectSiblingsKept(ts);
+  }
+}
+
+TEST_F(HandBuiltTest, KeepsAUnionVectorAPutNamingNoTableCannotWrite) {
+  // NONE holds no table to write, so the vector is left as stored rather than
+  // given an empty element.
+  const auto initial = GetBuffer(
+      R"({"string": "kept", "object": {"i8": 3}, "i32": 7, )"
+      R"("number_vector_type": ["Integer"], "number_vector": [{"value": 4}]})");
+  for (const auto& path :
+       {std::vector<uint32_t>{fieldOffset("number_vector"), 0, kNone, 4},
+        std::vector<uint32_t>{fieldOffset("number_vector"), 1, kNone, 4},
+        std::vector<uint32_t>{fieldOffset("number_vector"), 1, 256U + kInteger,
+                              4}}) {
+    auto result = applyPut(initial, path);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_NE(ts->number_vector(), nullptr);
+    ASSERT_EQ(ts->number_vector()->size(), 1U);
+    ASSERT_EQ(ts->number_vector_type()->size(), 1U);
+    EXPECT_EQ(ts->number_vector()->GetAs<matcher_test::Integer>(0)->value(), 4);
+    expectSiblingsKept(ts);
+  }
+}
+
+TEST_F(HandBuiltTest, DeletesNothingForAMemberPastADiscriminantsRange) {
+  const auto initial = GetBuffer(
+      R"({"string": "kept", "object": {"i8": 3}, "i32": 7, )"
+      R"("number_type": "Integer", "number": {"value": 5}, )"
+      R"("number_vector_type": ["Integer"], "number_vector": [{"value": 4}]})");
+  for (const auto& path :
+       {std::vector<uint32_t>{fieldOffset("number"), 256U + kInteger},
+        std::vector<uint32_t>{fieldOffset("number_vector"), 0,
+                              256U + kInteger}}) {
+    auto result = applyDelete(initial, path);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_EQ(ts->number_type(), matcher_test::Number::Integer);
+    EXPECT_EQ(ts->number_as_Integer()->value(), 5);
+    ASSERT_NE(ts->number_vector(), nullptr);
+    EXPECT_EQ(ts->number_vector()->size(), 1U);
+    EXPECT_EQ(ts->number_vector_type()->size(), 1U);
+    expectSiblingsKept(ts);
+  }
+}
+
+TEST_F(HandBuiltTest, KeepsAVectorAPutCannotGrowToFitAFlatbuffer) {
+  const auto initial = GetBuffer(
+      R"({"string": "kept", "object": {"i8": 3}, "i32": 7, )"
+      R"("i32_vector": [1], "string_vector": ["a"], "object_vector": [{}]})");
+  for (const auto* name : {"i32_vector", "string_vector", "object_vector"}) {
+    auto result = applyPut(initial, {fieldOffset(name), 4000000000U});
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_NE(ts->i32_vector(), nullptr) << name;
+    EXPECT_EQ(ts->i32_vector()->size(), 1U) << name;
+    ASSERT_NE(ts->string_vector(), nullptr) << name;
+    EXPECT_EQ(ts->string_vector()->size(), 1U) << name;
+    ASSERT_NE(ts->object_vector(), nullptr) << name;
+    EXPECT_EQ(ts->object_vector()->size(), 1U) << name;
+    expectSiblingsKept(ts);
+  }
 }
