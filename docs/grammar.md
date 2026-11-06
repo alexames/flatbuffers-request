@@ -24,9 +24,31 @@ array are refused. Nothing may follow the operation but whitespace.
 `value` is parsed as JSON against the field's type:
 tables, union members and vectors of tables go through the FlatBuffers JSON
 parser, and everything else -- scalars, enums, strings, structs, and vectors
-and arrays of scalars -- through a flexbuffer. A payload of the wrong kind is
-refused rather than coerced, so an enum takes its ORDINAL and not its name: a
-name would read as 0.
+and arrays of scalars -- as a flexbuffer, read by the library itself. A value
+of the wrong kind is refused rather than coerced, so an enum takes its
+ORDINAL and not its name: a name would read as 0.
+
+## Values
+
+A value is checked against the scalar, string, struct, vector or array it is
+written as, wherever that is: a field, a vector element, a struct member, an
+element of an array in a struct, a member named in a struct's map, or an
+element of a whole vector or array. Anything else is refused.
+
+| Target | Takes |
+|--------|-------|
+| bool | `true`, `false`, `0` or `1`. |
+| integer, enum | A whole numeral, decimal or `0x` hex, with an optional sign, within the target's width: `put i8 300`, `put ui8 -1` and `put color 256` are refused, not wrapped. A uint64 takes all of `0` to `18446744073709551615`. A fraction, an exponent (`1e2`), a bool or a non-finite value is not an integer. |
+| float32 | Any number that does not round to infinity as a float32 (`1e39` is refused; `3.4028235e38` is the largest float32): an integer, past the 64-bit ranges too, a decimal or exponent numeral, and `inf`, `infinity` or `nan` with an optional sign. |
+| float64 | Any number a double holds, as for a float32. A numeral too large for a double (`1e309`) is refused; one too small for its type (`1e-400`) is written as the nearest value it holds, 0 or a subnormal. Hex floats (`0x1p3`) are not read. |
+| string | A string quoted with `"` or `'`, holding no control character and valid UTF-8, with the escapes `\"`, `\'`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX` (a surrogate pair as two) and `\xXX` (a byte). |
+| vector | A list of values its element takes, possibly empty, with an optional trailing comma. |
+| array, struct | As [design.md](design.md) describes: a non-empty list no longer than the array, or a map naming only members the struct declares. |
+
+A map's keys are quoted or bare names, and may not repeat. `null` is no
+value, and comments are not read. A numeral may not run on into other text
+(`put i32 5abc`, `put f32 1.5f`), and nothing may follow a value but
+whitespace, or the `;` or `}` of a patch.
 
 ## Paths
 

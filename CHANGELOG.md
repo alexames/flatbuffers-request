@@ -40,8 +40,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   declared length, and any of these as the value of a member a map names
   (`put nested {"inner": {}, "tail": 77}`), which wrote the members beside it.
   A hand-built request carrying one is `Refused`.
+- A value for a scalar, a string, a struct, or a vector or array of scalars is
+  read by the library's own JSON value reader, and checked against what it
+  is written as (see `docs/grammar.md`). Values that were accepted and are now
+  refused: `null`, which wrote 0; a bool for an integer (`put i32 true` wrote
+  1); a fraction or exponent for an integer (`put i32 1.5` wrote 1); an
+  integer out of its field's range; a hex float (`0x1p3`); a comment; and a
+  string holding a control character or text that is not UTF-8.
 
 ### Fixed
+- A value of the wrong kind for a scalar was written: `put i8 [5]` wrote the
+  list's length, and a list or map given as a vector element or a struct
+  member did the same. Each is refused, wherever the scalar is.
+- An integer out of range for its field wrapped (`put i8 300` wrote 44,
+  `put ui8 -1` wrote 255), a numeral past the signed 64-bit range was written
+  as 0, and a finite float past a float32's range was written as infinity.
+  Each is refused. A bool takes `true`, `false`, 0 or 1, and no other number;
+  an integer takes no fraction or exponent.
+- A uint64 above 2^63 - 1 was written as 0 when put as a field, a struct
+  member, an element of a vector or an array, or in a whole vector
+  (`put ui64_vector [18446744073709551615]`). The whole range, 0 to
+  2^64 - 1, is written, and a numeral past it is refused.
 - A hand-built `put` whose payload was not what its field holds read it
   unchecked: a table payload that was empty, a flexbuffer or truncated read
   out of bounds, and so did a flexbuffer payload that did not verify. The

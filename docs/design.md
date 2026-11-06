@@ -78,8 +78,15 @@ A `put` is REFUSED, rather than served wrongly, for:
 - a whole vector of **unions**, whose element types live in a second vector
   that a JSON array cannot carry.
 - a payload of the wrong kind for its field — a string where a number belongs
-  (so an enum takes its ordinal, never its name, which would read as 0), or a
-  non-map for a struct.
+  (so an enum takes its ordinal, never its name, which would read as 0), a
+  list or a map where a scalar belongs, or a non-map for a struct -- or out of
+  its range: an integer past its width, a finite float past a float32's. See
+  [grammar.md](grammar.md#values).
+
+The flexbuffer payloads are read by the library's own value reader rather
+than FlatBuffers' flexbuffer parser, which reads a numeral past the signed
+64-bit range as 0: a uint64 above 2^63 - 1 would be written as 0, and an
+out-of-range value could not be told from a 0 the request spelled.
 
 A `delete` is unaffected by those refusals: removing a whole element is well
 defined where writing one is not, so `delete struct_vector[0]` still works.

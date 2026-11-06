@@ -1,7 +1,9 @@
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <ranges>
 #include <span>
 #include <string>
@@ -1816,4 +1818,437 @@ TEST_F(PathResolutionTest, RefusesAPatchOfWhatAPutCannotWrite) {
   EXPECT_FALSE(parses("patch struct_vector[0] { put i8 1 }"));
   EXPECT_FALSE(parses("patch object_vector[4000000000] { put i8 1 }"));
   EXPECT_TRUE(parses("patch object_vector[3] { put i8 1 }"));
+}
+
+// A scalar's value is checked against the scalar it is written as, wherever
+// the scalar is: a field, an element of a vector, a member of a struct, an
+// element of an array in one, a member named in a struct's map, or an
+// element of a whole vector or array.
+class ScalarValueTest : public BufferRequestTest {
+ protected:
+  // Every request writing `value` as the scalar `field` names, at each of the
+  // places a scalar is written. `field` is a scalar field of the root table
+  // that `ScalarStruct` declares too, and the vector `<field>_vector` holds.
+  static std::vector<std::string> everywhere(const std::string& field,
+                                             const std::string& value) {
+    return {
+        "put " + field + " " + value,
+        "put " + field + "_vector[0] " + value,
+        "put " + field + "_vector[2] " + value,
+        "put " + field + "_vector [" + value + "]",
+        "put " + field + "_vector [0, " + value + "]",
+        "put scalars." + field + " " + value,
+        "put scalars {\"" + field + "\": " + value + "}",
+        "put object." + field + " " + value,
+        "patch { put " + field + " " + value + " }",
+    };
+  }
+
+  // The requests writing `value` into an element of a fixed-length array of
+  // int32, which `ScalarStruct` holds as `i32_array`.
+  static std::vector<std::string> intoArray(const std::string& value) {
+    return {
+        "put scalars.i32_array[1] " + value,
+        "put scalars.i32_array [" + value + "]",
+        "put scalars {\"i32_array\": [1, " + value + "]}",
+    };
+  }
+
+  void expectRefusedEverywhere(const std::string& field,
+                               const std::string& value) {
+    for (const auto& request : everywhere(field, value)) {
+      EXPECT_FALSE(parses(request)) << request;
+    }
+  }
+
+  void expectAcceptedEverywhere(const std::string& field,
+                                const std::string& value) {
+    for (const auto& request : everywhere(field, value)) {
+      EXPECT_TRUE(parses(request)) << request;
+    }
+  }
+};
+
+TEST_F(ScalarValueTest, RefusesAValueOfTheWrongKind) {
+  for (const auto* field : {"b", "i8", "ui8", "i32", "ui64", "f32", "f64"}) {
+    for (const auto* value :
+         {"[5]", "[]", R"({"a": 1})", "{}", R"("5")", "null", "nope"}) {
+      expectRefusedEverywhere(field, value);
+    }
+  }
+  for (const auto* value : {"[5]", R"({"a": 1})", R"("5")", "true", "1.5"}) {
+    for (const auto& request : intoArray(value)) {
+      EXPECT_FALSE(parses(request)) << request;
+    }
+  }
+  // An integer takes a whole numeral: not a fraction, an exponent or a bool.
+  for (const auto* field : {"i8", "ui16", "i32", "ui64"}) {
+    for (const auto* value : {"1.5", "1.0", "1e2", "true", "false"}) {
+      expectRefusedEverywhere(field, value);
+    }
+  }
+}
+
+TEST_F(ScalarValueTest, WritesNotAVectorsLengthForAScalar) {
+  // A one-element list on a scalar read as the list's length.
+  EXPECT_FALSE(parses("put i8 [5]"));
+  EXPECT_FALSE(parses("put i8_vector[0] [5, 6]"));
+}
+
+TEST_F(ScalarValueTest, RefusesAnIntegerOutOfRangeForItsWidth) {
+  const auto cases = std::vector<std::pair<std::string, std::string>>{
+      {"i8", "128"},
+      {"i8", "-129"},
+      {"i8", "300"},
+      {"ui8", "256"},
+      {"ui8", "-1"},
+      {"i16", "32768"},
+      {"i16", "-32769"},
+      {"ui16", "65536"},
+      {"ui16", "-1"},
+      {"i32", "2147483648"},
+      {"i32", "-2147483649"},
+      {"ui32", "4294967296"},
+      {"ui32", "-1"},
+      {"i64", "9223372036854775808"},
+      {"i64", "-9223372036854775809"},
+      {"i64", "99999999999999999999999"},
+      {"ui64", "18446744073709551616"},
+      {"ui64", "-1"},
+  };
+  for (const auto& [field, value] : cases) {
+    expectRefusedEverywhere(field, value);
+  }
+  for (const auto& request : intoArray("2147483648")) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+}
+
+TEST_F(ScalarValueTest, WritesEveryIntegerAtTheEdgesOfItsWidth) {
+  const auto cases = std::vector<std::pair<std::string, std::string>>{
+      {"i8", "-128"},
+      {"i8", "127"},
+      {"ui8", "255"},
+      {"i16", "-32768"},
+      {"ui16", "65535"},
+      {"i32", "-2147483648"},
+      {"ui32", "4294967295"},
+      {"i64", "-9223372036854775808"},
+      {"i64", "9223372036854775807"},
+      {"ui64", "18446744073709551615"},
+      {"ui64", "0"},
+  };
+  for (const auto& [field, value] : cases) {
+    expectAcceptedEverywhere(field, value);
+  }
+  auto result = applyRequestTo(GetBuffer("{}"),
+                               R"(patch { put i8 -128 ; put ui8 255 ; )"
+                               R"(put i16 -32768 ; put ui32 4294967295 ; )"
+                               R"(put i64 -9223372036854775808 })");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->i8(), -128);
+  EXPECT_EQ(ts->ui8(), 255);
+  EXPECT_EQ(ts->i16(), -32768);
+  EXPECT_EQ(ts->ui32(), 4294967295U);
+  EXPECT_EQ(ts->i64(), INT64_MIN);
+}
+
+TEST_F(ScalarValueTest, WritesTheWholeUnsigned64BitRange) {
+  constexpr auto kTop = uint64_t{18446744073709551615U};
+  constexpr auto kPastSigned = uint64_t{9223372036854775808U};
+  // Each answer reads the last result, which the next call replaces.
+  auto kept = flatbuffers::DetachedBuffer{};
+  auto ts = [&](const char* request) {
+    kept = applyRequestTo(GetBuffer(R"({"ui64_vector": [1, 2]})"), request);
+    return matcher_test::GetTestSchema(kept.data());
+  };
+  EXPECT_EQ(ts("put ui64 18446744073709551615")->ui64(), kTop);
+  EXPECT_EQ(ts("put ui64 9223372036854775808")->ui64(), kPastSigned);
+  EXPECT_EQ(ts("put object.ui64 18446744073709551615")->object()->ui64(), kTop);
+  EXPECT_EQ(ts("put scalars.ui64 18446744073709551615")->scalars()->ui64(),
+            kTop);
+  EXPECT_EQ(
+      ts(R"(put scalars {"ui64": 18446744073709551615})")->scalars()->ui64(),
+      kTop);
+  EXPECT_EQ(
+      ts("put ui64_vector[1] 18446744073709551615")->ui64_vector()->Get(1),
+      kTop);
+  EXPECT_EQ(
+      ts("put ui64_vector[3] 18446744073709551615")->ui64_vector()->Get(3),
+      kTop);
+  const auto* whole =
+      ts("put ui64_vector [18446744073709551615, 9223372036854775808, 5]")
+          ->ui64_vector();
+  ASSERT_EQ(whole->size(), 3U);
+  EXPECT_EQ(whole->Get(0), kTop);
+  EXPECT_EQ(whole->Get(1), kPastSigned);
+  EXPECT_EQ(whole->Get(2), 5U);
+  EXPECT_EQ(
+      ts(R"(put object {"ui64": 18446744073709551615})")->object()->ui64(),
+      kTop);
+  EXPECT_EQ(ts(R"(put object_vector [{"ui64": 18446744073709551615}])")
+                ->object_vector()
+                ->Get(0)
+                ->ui64(),
+            kTop);
+}
+
+TEST_F(ScalarValueTest, RefusesTextAfterAValue) {
+  for (const auto* request : {
+           "put i32 5abc",
+           "put i32 5 6",
+           "put i32 5,",
+           "put i32 5]",
+           "put i32 0x10g",
+           "put f32 1.5f",
+           "put b truest",
+           "put i32_vector [1] 2",
+           "put i32_vector [1 2]",
+           R"(put scalars {"i8": 1} 2)",
+           R"(put scalars {"i8": 1 "i16": 2})",
+           R"(put string "a" "b")",
+           "patch { put i32 5abc }",
+           "patch { put i32 5 6 }",
+       }) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+  EXPECT_TRUE(parses("patch { put i32 5 ; put i8 6 }"));
+  EXPECT_TRUE(parses("put i32_vector [1, 2, ]"));
+}
+
+TEST_F(ScalarValueTest, ReadsAHexIntegerAgainstItsWidthToo) {
+  auto result = applyRequestTo(GetBuffer("{}"),
+                               "patch { put i32 0x10 ; put i8 -0x80 ; "
+                               "put ui64 0xFFFFFFFFFFFFFFFF }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->i32(), 16);
+  EXPECT_EQ(ts->i8(), -128);
+  EXPECT_EQ(ts->ui64(), uint64_t{18446744073709551615U});
+  expectRefusedEverywhere("i8", "0x80");
+  expectRefusedEverywhere("ui64", "0x10000000000000000");
+  expectRefusedEverywhere("i32", "0x");
+}
+
+TEST_F(ScalarValueTest, RefusesAFiniteFloatPastWhatAFloat32Holds) {
+  for (const auto* value : {"1e39", "-1e39", "3.5e38"}) {
+    for (const auto& request : everywhere("f32", value)) {
+      EXPECT_FALSE(parses(request)) << request;
+    }
+  }
+  // A double literal past a double's range is no finite number either.
+  expectRefusedEverywhere("f64", "1e309");
+  // A numeral that rounds to the largest float32 is that float.
+  auto result = applyRequestTo(GetBuffer("{}"), "put f32 3.4028235e38");
+  EXPECT_EQ(matcher_test::GetTestSchema(result.data())->f32(),
+            std::numeric_limits<float>::max());
+  expectAcceptedEverywhere("f64", "1e300");
+}
+
+TEST_F(ScalarValueTest, WritesInfinitiesAndNotANumber) {
+  for (const auto* field : {"f32", "f64"}) {
+    for (const auto* value : {"inf", "-inf", "+inf", "infinity", "nan"}) {
+      expectAcceptedEverywhere(field, value);
+    }
+  }
+  auto result = applyRequestTo(GetBuffer("{}"),
+                               "patch { put f32 -inf ; put f64 nan ; "
+                               "put scalars.f32 inf }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_TRUE(std::isinf(ts->f32()) and ts->f32() < 0);
+  EXPECT_TRUE(std::isnan(ts->f64()));
+  EXPECT_TRUE(std::isinf(ts->scalars()->f32()));
+  // An integer is a float's value too.
+  EXPECT_EQ(matcher_test::GetTestSchema(
+                applyRequestTo(GetBuffer("{}"), "put f32 3").data())
+                ->f32(),
+            3.0F);
+  // And not for an integer.
+  expectRefusedEverywhere("i32", "inf");
+  expectRefusedEverywhere("i32", "nan");
+}
+
+TEST_F(ScalarValueTest, TakesTrueFalseZeroOrOneForABool) {
+  for (const auto* value : {"true", "false", "0", "1"}) {
+    expectAcceptedEverywhere("b", value);
+  }
+  for (const auto* value : {"2", "-1", "0.5", "1.0", R"("true")", "True"}) {
+    expectRefusedEverywhere("b", value);
+  }
+  auto result =
+      applyRequestTo(GetBuffer("{}"), "patch { put b 1 ; put scalars.b true }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_TRUE(ts->b());
+  EXPECT_TRUE(ts->scalars()->b());
+}
+
+TEST_F(ScalarValueTest, ChecksAnEnumsOrdinalAgainstItsWidth) {
+  // Color is a ubyte.
+  EXPECT_FALSE(parses("put color 256"));
+  EXPECT_FALSE(parses("put color -1"));
+  EXPECT_FALSE(parses("put color_vector [4, 256]"));
+  EXPECT_TRUE(parses("put color 255"));
+}
+
+TEST_F(ScalarValueTest, RefusesAWrongKindForAStringOrAVectorOfStrings) {
+  for (const auto* request :
+       {"put string 5", "put string [\"a\"]", "put string_vector [1]",
+        "put string_vector[0] 5", "put string_vector \"a\"", "put i32_vector 5",
+        R"(put i32_vector {"a": 1})"}) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+}
+
+TEST_F(ScalarValueTest, ReadsStringEscapes) {
+  // Spelt with doubled backslashes: a raw string still reads a universal
+  // character name.
+  auto result = applyRequestTo(
+      GetBuffer("{}"),
+      "put string \"a\\\"b\\\\c\\n\\t\\u00e9\\ud83d\\ude00/\\/\"");
+  const auto* string = matcher_test::GetTestSchema(result.data())->string();
+  ASSERT_NE(string, nullptr);
+  EXPECT_EQ(string->str(), "a\"b\\c\n\t\xc3\xa9\xf0\x9f\x98\x80//");
+  EXPECT_FALSE(parses("put string \"\\ud83d\""));
+  EXPECT_FALSE(parses("put string \"\\q\""));
+  EXPECT_FALSE(parses("put string \"open"));
+}
+
+TEST_F(HandBuiltTest, RefusesAScalarPayloadOutOfItsFieldsRange) {
+  const auto initial = withUnion(kInteger);
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("i8")}, flexPayload("300")),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("ui8")}, flexPayload("-1")),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(
+      putOutcome(initial, {fieldOffset("i8_vector")}, flexPayload("[1, 300]")),
+      ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("b")}, flexPayload("2")),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("f32")}, flexPayload("1e39")),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("i8")}, flexPayload("[5]")),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("i8")}, flexPayload("127")),
+            ApplyOutcome::Applied);
+}
+
+TEST_F(ScalarValueTest, ChecksAValueAgainstTheArrayElementItIsWrittenAs) {
+  constexpr auto kTop = uint64_t{18446744073709551615U};
+  for (const auto* request : {
+           "put wide.ui64_array[1] 18446744073709551615",
+           "put wide.ui64_array [18446744073709551615, 9223372036854775808]",
+           R"(put wide {"ui64_array": [18446744073709551615]})",
+       }) {
+    auto result = applyRequestTo(GetBuffer("{}"), request);
+    const auto* wide = matcher_test::GetTestSchema(result.data())->wide();
+    ASSERT_NE(wide, nullptr) << request;
+    EXPECT_TRUE(wide->ui64_array()->Get(0) == kTop
+                or wide->ui64_array()->Get(1) == kTop)
+        << request;
+  }
+  for (const auto* request : {
+           "put wide.ui64_array[0] 18446744073709551616",
+           "put wide.ui64_array[0] -1",
+           "put wide.ui64_array [1.5]",
+           "put wide.b_array[0] 2",
+           "put wide.b_array [true, 0.5]",
+           R"(put wide {"b_array": ["true"]})",
+           "put wide.f32_array[0] 1e39",
+           "put wide.f32_array [1, [2]]",
+           R"(put wide {"f32_array": [-1e39]})",
+       }) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+  for (const auto* request :
+       {"put wide.b_array [true, 0]", "put wide.f32_array [inf, nan]",
+        "put wide.f32_array[1] 3"}) {
+    EXPECT_TRUE(parses(request)) << request;
+  }
+}
+
+TEST_F(ScalarValueTest, WritesAnIntegerPastBoth64BitRangesAsAFloat) {
+  // A double holds it, so a float takes it; an integer does not.
+  auto result = applyRequestTo(GetBuffer("{}"),
+                               "patch { put f64 18446744073709551616 ; "
+                               "put f32 -9223372036854775809 }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_DOUBLE_EQ(ts->f64(), 18446744073709551616.0);
+  EXPECT_FLOAT_EQ(ts->f32(), -9223372036854775809.0F);
+  EXPECT_FALSE(parses("put ui64 18446744073709551616"));
+  EXPECT_FALSE(parses("put f64 0x10000000000000000"));
+}
+
+TEST_F(ScalarValueTest, ReadsAFloatTooSmallForItsTypeAsTheNearestItHolds) {
+  auto result = applyRequestTo(GetBuffer("{}"),
+                               "patch { put f64 1e-400 ; put f32 1e-50 }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->f64(), 0.0);
+  EXPECT_EQ(ts->f32(), 0.0F);
+}
+
+// What the value reader takes, as the FlatBuffers JSON parser takes it.
+TEST_F(ScalarValueTest, ReadsTheSpellingsAJsonValueMayTake) {
+  auto result = applyRequestTo(
+      GetBuffer("{}"),
+      "patch { put i32 +5 ; put f32 .5 ; put f64 -.5e1 ; put ui8 0x0F ; "
+      "put string 'it\\'s \\x41\\/' ; put scalars {i8: 3, 'i16': 4,} ; "
+      "put i32_vector [\n 1 ,\t2\n] }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  EXPECT_EQ(ts->i32(), 5);
+  EXPECT_EQ(ts->f32(), 0.5F);
+  EXPECT_EQ(ts->f64(), -5.0);
+  EXPECT_EQ(ts->ui8(), 15);
+  ASSERT_NE(ts->string(), nullptr);
+  EXPECT_EQ(ts->string()->str(), "it's A/");
+  ASSERT_NE(ts->scalars(), nullptr);
+  EXPECT_EQ(ts->scalars()->i8(), 3);
+  EXPECT_EQ(ts->scalars()->i16(), 4);
+  ASSERT_NE(ts->i32_vector(), nullptr);
+  EXPECT_EQ(ts->i32_vector()->size(), 2U);
+  // A trailing point makes a float, which an integer does not take.
+  EXPECT_TRUE(parses("put f64 1."));
+  EXPECT_FALSE(parses("put i16 1."));
+}
+
+TEST_F(ScalarValueTest, RefusesWhatIsNoValue) {
+  for (const auto* request : {
+           "put i32_vector [,]",
+           "put i32_vector [1,,2]",
+           R"(put scalars {"i8": 1, "i8": 2})",
+           R"(put scalars {i8 1})",
+           "put string \"\\udc00\"",
+           "put string \"\\ud83d\\u0041\"",
+           "put string \"a\tb\"",
+           "put string \"\xff\"",
+           "put string \"\xc3\"",
+           "put i64 -0x8000000000000001",
+           "put f64 1e",
+           "put f64 1e+",
+           "put f64 1..5",
+           "put f64 -",
+           "put f64 .",
+       }) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+  EXPECT_TRUE(parses("put i64 -0x8000000000000000"));
+  EXPECT_TRUE(parses("put string \"\xc3\xa9\""));
+  // Nesting past what the reader allows is refused rather than recursed into.
+  EXPECT_FALSE(parses("put i32 " + std::string(100000, '[')));
+}
+
+TEST_F(HandBuiltTest, RefusesAScalarPayloadOfAnotherKind) {
+  const auto initial = withUnion(kInteger);
+  for (const auto* json : {"1.5", "true", "null"}) {
+    EXPECT_EQ(putOutcome(initial, {fieldOffset("i32")}, flexPayload(json)),
+              ApplyOutcome::Refused)
+        << json;
+  }
+  // An unsigned payload past the signed range, which the FlatBuffers parser
+  // cannot spell, is a uint64 and no int64.
+  flexbuffers::Builder top;
+  top.UInt(uint64_t{18446744073709551615U});
+  top.Finish();
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("i64")}, top.GetBuffer()),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {fieldOffset("ui64")}, top.GetBuffer()),
+            ApplyOutcome::Applied);
 }

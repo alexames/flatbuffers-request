@@ -300,64 +300,27 @@ std::optional<Offset<Put>> parseFlatbufferPut_ParseTable(
                                     parser.builder_.GetSize()));
 }
 
-// Whether a flexbuffer payload is the kind of value the field it is destined
-// for can hold. Only the mismatches apply can neither detect nor represent are
-// rejected: a string where a number belongs reads as 0, and a struct needs a
-// map to name its members by.
-bool payloadTypeAccepts(reflection::BaseType payloadType,
-                        flexbuffers::Reference value) {
-  switch (payloadType) {
-    case reflection::String:
-      return value.IsString();
-    case reflection::Obj:
-      // Reached only for a struct; a table is parsed against the schema.
-      return value.IsMap();
-    case reflection::Vector:
-    case reflection::Array:
-      return value.IsVector() or value.IsTypedVector();
-    case reflection::None:
-    case reflection::UType:
-    case reflection::Union:
-      return true;
-    default:
-      return not value.IsString() and not value.IsMap();
-  }
-}
-
 std::optional<Offset<Put>> parseFlatbufferPut_ParsePrimitive(
     FlatBufferBuilder& fbb, std::string_view* requestString,
     const reflection::Schema* schema, Offset<Vector<uint32_t>>& offsets,
     const reflection::Type* type, bool elementInVector) {
-  auto parser = Parser{};
-  if (not parser.ParseFlexBuffer(requestString->data(), nullptr,
-                                 &parser.flex_builder_)) {
+  auto flexBuilder = flexbuffers::Builder{};
+  // Advances past the payload so a caller (e.g. a patch's update list) can
+  // continue parsing after it.
+  if (not parseFlexValue(*requestString, flexBuilder)) {
     return std::nullopt;
   }
-  const auto root = flexbuffers::GetRoot(parser.flex_builder_.GetBuffer());
-  // A scalar field takes a number. An enum is a scalar, and its NAME is not
-  // accepted: apply reads a string as a number, which answers 0 for every
-  // name, so accepting one here would write a wrong value rather than refuse
-  // a wrong request.
-  const auto payloadType =
-      elementInVector ? type->element() : type->base_type();
-  if (not payloadTypeAccepts(payloadType, root)) {
+  flexBuilder.Finish();
+  const auto& payload = flexBuilder.GetBuffer();
+  // The payload has to be a value of the kind its target holds, in its
+  // range, and a struct or an array in one has to take it whole. An enum is
+  // a scalar, and its NAME is not accepted: apply reads a string as a
+  // number, which answers 0 for every name.
+  if (not payloadFits(schema, type, elementInVector,
+                      flexbuffers::GetRoot(payload))) {
     return std::nullopt;
   }
-  // A struct, or an array in one, has to take its payload whole: a put that
-  // writes none of it, or drops part of it, is refused.
-  const auto structOrArray =
-      type->base_type() == reflection::Array
-      or (payloadType == reflection::Obj
-          and schema->objects()->Get(type->index())->is_struct());
-  if (structOrArray and not payloadFits(schema, type, elementInVector, root)) {
-    return std::nullopt;
-  }
-  // Advance past the parsed payload so a caller (e.g. a patch's update list)
-  // can continue parsing after it.
-  requestString->remove_prefix(parser.BytesConsumed());
-  return CreatePut(fbb, offsets,
-                   fbb.CreateVector(parser.flex_builder_.GetBuffer().data(),
-                                    parser.flex_builder_.GetBuffer().size()));
+  return CreatePut(fbb, offsets, fbb.CreateVector(payload));
 }
 
 std::optional<Offset<Put>> parseFlatbufferPut(
@@ -545,8 +508,8 @@ std::optional<Operation> parseFlatbufferOperationEnum(
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 std::optional<fbrequest::ByteBuffer> fbrequest::parseFlatbufferRequest(
     const reflection::Schema* schema, std::string_view requestString) {
-  // The flatbuffers JSON and flexbuffer parsers take a C string and read to
-  // its terminator, which a view does not promise; this copy supplies one.
+  // The flatbuffers JSON parser takes a C string and reads to its
+  // terminator, which a view does not promise; this copy supplies one.
   const auto terminated = std::string{requestString};
   requestString = terminated;
   auto operation = parseFlatbufferOperationEnum(&requestString);

@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 #include "flatbuffers/flexbuffers.h"
 #include "flatbuffers/reflection.h"
@@ -11,7 +12,25 @@
 // refuses a hand-built request the parser would not have produced. Internal
 // to the library; not part of the installed public headers.
 
-// Whether `value` is a value a scalar of `type` holds.
+// Reads the JSON value at the front of `text` into `builder`, advancing `text`
+// past it and no further. Maps (keys quoted or bare), lists, strings, `true`
+// and `false` are read as the FlatBuffers JSON parser reads them, a trailing
+// comma included. A number is read exactly: a decimal or hex integer as a
+// signed 64-bit integer, or as an unsigned one where only that holds it, and
+// anything else -- a fraction or an exponent, a decimal integer past both
+// 64-bit ranges, or `inf`, `infinity` or `nan` with an optional sign -- as a
+// double. Answers false, with `text` and `builder` unspecified, for text that
+// does not start with such a value: `null`, a hex integer past 64 bits, a
+// finite numeral too large for a double, a numeral running on into a name or
+// a second point (`5abc`, `5..`), a string holding a control character or
+// text that is not UTF-8, a duplicated map key, or nesting past the
+// FlatBuffers parser's depth.
+bool parseFlexValue(std::string_view& text, flexbuffers::Builder& builder);
+
+// Whether `value` is a value a scalar of `type` holds. A bool takes `true`,
+// `false`, 0 or 1. An integer type takes an integer within its range, never a
+// bool or a float. A float32 takes any integer, an infinity or NaN, or a
+// finite float it does not round to infinity; a float64 any number.
 bool scalarFits(flexbuffers::Reference value, reflection::BaseType type);
 
 // The bytes of `value` as a scalar of `type`, in the first GetTypeSize(type)
