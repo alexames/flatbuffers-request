@@ -159,7 +159,7 @@ root into the caller's builder only where it is `Applied`:
 |---------|---------|
 | `Applied` | Every operation made the edit it names. A put of the value a field already holds is applied. |
 | `NotStored` | A delete names something the buffer does not store. Nothing is built. |
-| `Refused` | An operation cannot make the edit it names, whatever the buffer stores. Nothing is built. The parser refuses each such request; a hand-built one can still carry one. |
+| `Refused` | An operation cannot make the edit it names, whatever the buffer stores, or would copy, unedited, something no copy can keep as it was: a union payload stored under NONE or under a member its union does not declare, a vector of unions whose discriminants do not pair with its elements, a discriminant stored without its union, or a field the schema does not declare (see [design.md](design.md#copying-what-a-request-does-not-edit)). Nothing is built. The parser refuses each request of the first kind; a hand-built one can still carry one. |
 
 `applyRequest` answers the same with only a root, null where nothing was built.
 

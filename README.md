@@ -75,6 +75,7 @@ The public API is in namespace `fbrequest` ([include/fbrequest/FlatbufferRequest
 | `tryApplyRequest(fbb, schema, source, request)` | Apply a parsed request to `source`, building the result into `fbb` only where every operation makes the edit it names. Answers `Applied`, `NotStored` (a delete of something the buffer does not store) or `Refused`. |
 | `applyRequest(fbb, schema, source, request)` | As `tryApplyRequest`, answering only the root: null where nothing was built. |
 | `copyTable(fbb, schema, ptr, pool)` | Deep-copy a table by reflection (the primitive `applyRequest` builds on). |
+| `verifyBuffer(schema, buffer)` | Verify a buffer against a schema, reading 64-bit offsets, struct and string union members and union values as FlatBuffers' reflection `Verify` does not. |
 
 ## Request language
 
@@ -117,7 +118,7 @@ Or with Visual Studio: `cmake --preset vs && cmake --build build --config Releas
 
 ## Relationship to FlatBuffers versions
 
-This library uses FlatBuffers reflection **internals** (the `Parser`, `CopyTable`, and reflection structs), which upstream does not guarantee stable across releases. It is developed against FlatBuffers `25.12.19`. A major FlatBuffers bump may require a corresponding release here — see [docs/design.md](docs/design.md).
+This library uses FlatBuffers reflection **internals** (the `Parser` and reflection structs), which upstream does not guarantee stable across releases. It is developed against FlatBuffers `25.12.19`. A major FlatBuffers bump may require a corresponding release here — see [docs/design.md](docs/design.md).
 
 ## License
 

@@ -49,6 +49,7 @@ cpp_library(
         "FlatbufferRequestParse.cpp"
         "PayloadValue.cpp"
         "StringScan.cpp"
+        "TableCopy.cpp"
     HEADERS
         "fbrequest/FlatbufferRequest.hpp"
     DEPENDENCIES
@@ -106,6 +107,7 @@ if(FBREQUEST_BUILD_TESTS)
       SOURCE_DIR "test"
       SOURCES
           "FlatbufferRequestTest.cpp"
+          "TableCopyTest.cpp"
           "matchers/FlatbufferMatcher.cpp"
           "matchers/FlexbufferMatcher.cpp"
           "matchers/MatcherInternal.cpp"
