@@ -88,16 +88,15 @@ enum class ApplyOutcome : uint8_t {
   // or under a member its union does not declare, a vector of unions whose
   // discriminants do not pair one to one with its elements, a discriminant
   // stored without its union, or a field the schema does not declare. A request
-  // that
-  // removes such a field, or switches the union to another member, does not
-  // copy it.
+  // that removes such a field, or switches the union to another member, does
+  // not copy it.
   Refused,
 };
 
 // The result of `tryApplyRequest`.
 struct ApplyResult {
-  // The new root, built into the builder the request was applied with. Null
-  // unless `outcome` is Applied, and then not to be passed to `Finish`.
+  // The new root, built into the builder the request was applied with. Null,
+  // and not to be passed to `Finish`, unless `outcome` is Applied.
   flatbuffers::Offset<const flatbuffers::Table*> root{};
   // What the apply came to.
   ApplyOutcome outcome{ApplyOutcome::Refused};

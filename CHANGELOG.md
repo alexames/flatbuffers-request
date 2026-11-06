@@ -6,7 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-11-07
+## [0.5.0] - 2026-11-06
 
 An apply now answers whether it made the edit a request names, and builds
 nothing where it did not; the parser and the apply refuse what they served
