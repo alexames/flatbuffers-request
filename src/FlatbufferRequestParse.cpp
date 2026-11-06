@@ -98,6 +98,24 @@ bool isUnionDiscriminator(const reflection::Field* field) {
              and type->element() == reflection::UType);
 }
 
+// Whether element `index` of the vector or array `type`, whose elements are
+// of `elementDef` where they are tables or structs, is one a request can
+// name: an array cannot grow, so it holds only the elements its length gives,
+// and a `put` (`writing`) may not grow a vector past what a flatbuffer holds.
+bool elementReachable(const reflection::Type* type,
+                      const reflection::Object* elementDef, uint32_t index,
+                      bool writing) {
+  if (type->base_type() == reflection::Array) {
+    return index < type->fixed_length();
+  }
+  if (not writing) {
+    return true;
+  }
+  return (elementDef != nullptr and elementDef->is_struct())
+             ? structVectorCanGrowTo(elementDef, index)
+             : vectorCanGrowTo(type->element(), index);
+}
+
 // `writing` refuses the paths only a `put` cannot serve, for a put and for a
 // patch, whose operations may be puts: a delete resolves the same text and
 // removes a whole element, which is well defined where writing one is not.
@@ -159,24 +177,21 @@ std::optional<Offset<Vector<uint32_t>>> parseFlatbufferOffsetPath(
             return std::nullopt;
           }
           const auto elementBaseType = type->element();
-          const auto indexReachable =
-              (type->base_type() == reflection::Array)
-                  ? *arrayIndex < type->fixed_length()
-                  : not writing
-                        or vectorCanGrowTo(elementBaseType, *arrayIndex);
-          if (not indexReachable) {
+          const auto* elementDef = (elementBaseType == reflection::Obj)
+                                       ? schema->objects()->Get(type->index())
+                                       : nullptr;
+          const auto isArray = type->base_type() == reflection::Array;
+          if (not elementReachable(type, elementDef, *arrayIndex, writing)) {
             // An array cannot grow, so the element is not there; a vector
             // that grew to reach it would not fit in a flatbuffer.
             return std::nullopt;
           }
           *outElementInVector = true;
           offsets.push_back(*arrayIndex);
-          if (elementBaseType == reflection::Obj) {
-            const auto* elementDef = schema->objects()->Get(type->index());
-            if (writing and elementDef->is_struct()) {
-              // A struct element is inline, and nothing builds one: the apply
-              // generates no offset for it while the table builder still
-              // consumes one, which reads a neighbouring field's offset.
+          if (elementDef != nullptr) {
+            if (writing and isArray and elementDef->is_struct()) {
+              // The struct writer computes no stride for an element of an
+              // array of structs.
               return std::nullopt;
             }
             *outObject = elementDef;
@@ -189,22 +204,22 @@ std::optional<Offset<Vector<uint32_t>>> parseFlatbufferOffsetPath(
             *outObject = nullptr;
           }
         } else {
-          // Getting a path to the vector itself. Only a vector of TABLES
-          // names an object. `index` is set for a vector of enums and for a
-          // vector of unions too, where it names the ENUM, so reading it as
-          // an object index answers an unrelated object or runs off the end
-          // of the vector. A vector of unions has no whole-vector payload
-          // anyway: the types of its elements live in a second vector that a
-          // JSON array cannot carry.
+          // Getting a path to the vector itself. Only a vector of tables or
+          // structs names an object. `index` is set for a vector of enums and
+          // for a vector of unions too, where it names the ENUM, so reading it
+          // as an object index answers an unrelated object or runs off the
+          // end of the vector.
           const auto* elementDef = (type->element() == reflection::Obj)
                                        ? schema->objects()->Get(type->index())
                                        : nullptr;
+          const auto arrayOfStructs =
+              type->base_type() == reflection::Array and elementDef != nullptr;
           if (writing
-              and (type->element() == reflection::Union
-                   or (elementDef != nullptr and elementDef->is_struct()))) {
-            // A vector of unions has no whole-vector payload, and a vector of
-            // structs holds its elements inline with nothing to build one
-            // from. Neither is written here.
+              and (type->element() == reflection::Union or arrayOfStructs)) {
+            // A vector of unions has no whole-vector payload: the types of
+            // its elements live in a second vector that a JSON array cannot
+            // carry. An array of structs is not written, as its elements
+            // are not.
             return std::nullopt;
           }
           if (path->starts_with(".")) {
@@ -339,28 +354,23 @@ std::optional<Offset<Put>> parseFlatbufferPut(
   assert(not elementInVector or type->base_type() == reflection::Vector
          or type->base_type() == reflection::Array);
 
-  // Whether the payload needs parsing AGAINST the schema, which is exactly
-  // when the path resolved to an object: a table, a union member, or a vector
-  // of either. Reading `type->index()` instead would say yes for an
-  // enum-typed scalar as well, since its type names the enum -- and the path
-  // parser leaves no object for one, so the payload was handed to the table
-  // parser with nothing to parse against and the whole request was refused.
-  // Everything else, scalars and enums and vectors of them alike, is a
-  // flexbuffer payload.
-  if (typeObject != nullptr) {
+  // The payload is parsed AGAINST the schema exactly when the path resolved
+  // to a table: a table, a union member, or a vector of either. Reading
+  // `type->index()` instead would say yes for an enum-typed scalar as well,
+  // since its type names the enum, and the path parser leaves no object for
+  // one to be parsed against. Everything else -- scalars, enums, strings,
+  // structs, and vectors of any of them -- is a flexbuffer payload. A struct
+  // is carried as a flexbuffer map: it has no vtable to build, the apply
+  // writes its members into a fixed-size image by name, and the table parser
+  // would need it as a root type, which a struct cannot be.
+  if (typeObject != nullptr and not typeObject->is_struct()) {
     // NOLINTNEXTLINE(bugprone-branch-clone)
     if (type->base_type() == reflection::Vector and not elementInVector) {
       return parseFlatbufferPut_ParseVector(fbb, requestString, schema,
                                             typeObject, *offsets);
     }
-    if (not typeObject->is_struct()) {
-      return parseFlatbufferPut_ParseTable(fbb, requestString, schema,
-                                           typeObject, *offsets);
-    }
-    // A struct is carried as a flexbuffer map, not as a table: it has no
-    // vtable to build, and the apply writes its members into a fixed-size
-    // image by name. The table parser would need it as a root type, which a
-    // struct cannot be.
+    return parseFlatbufferPut_ParseTable(fbb, requestString, schema, typeObject,
+                                         *offsets);
   }
   // An element's payload is one of the element type; anything else is a
   // payload of the field's own type, including a whole vector or array.

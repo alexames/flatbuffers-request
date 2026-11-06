@@ -23,8 +23,9 @@ array are refused. Nothing may follow the operation but whitespace.
 
 `value` is parsed as JSON against the field's type:
 tables, union members and vectors of tables go through the FlatBuffers JSON
-parser, and everything else -- scalars, enums, strings, structs, and vectors
-and arrays of scalars -- as a flexbuffer, read by the library itself. A value
+parser, and everything else -- scalars, enums, strings, structs, vectors
+and arrays of scalars, and vectors of structs -- as a flexbuffer, read by the
+library itself. A value
 of the wrong kind is refused rather than coerced, so an enum takes its
 ORDINAL and not its name: a name would read as 0.
 
@@ -32,8 +33,9 @@ ORDINAL and not its name: a name would read as 0.
 
 A value is checked against the scalar, string, struct, vector or array it is
 written as, wherever that is: a field, a vector element, a struct member, an
-element of an array in a struct, a member named in a struct's map, or an
-element of a whole vector or array. Anything else is refused.
+element of an array in a struct, a member named in a struct's map, a member
+of an element of a vector of structs, or an element of a whole vector or
+array. Anything else is refused.
 
 | Target | Takes |
 |--------|-------|
@@ -44,6 +46,8 @@ element of a whole vector or array. Anything else is refused.
 | string | A string quoted with `"` or `'`, holding no control character and valid UTF-8, with the escapes `\"`, `\'`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX` (a surrogate pair as two) and `\xXX` (a byte). |
 | vector | A list of values its element takes, possibly empty, with an optional trailing comma. |
 | array, struct | As [design.md](design.md) describes: a non-empty list no longer than the array, or a map naming only members the struct declares. |
+| element of a vector of structs | A map as a struct takes, or `{}`, which names the element alone. |
+| vector of structs | A list, possibly empty, of maps each naming every member of the struct exactly once: a nested struct by a map of the same form, an array by a list of exactly its length. |
 
 A map's keys are quoted or bare names, and may not repeat. `null` is no
 value, and comments are not read. A numeral may not run on into other text
@@ -90,6 +94,16 @@ would be larger than a flatbuffer can hold.
   with empty elements (a union vector's padding is its first member). Setting
   an out-of-range index grows the vector, and an element of a vector the
   buffer does not store creates it, along with any table on the path to it.
+- **Vectors of structs:** `put struct_vector[1].i8 5` writes a member of an
+  element, through nested structs and into an array
+  (`put holder_vector[1].inner.arr[2] 7`); `put struct_vector[1] {"i8": 5}`
+  writes the members a map names, keeping the rest of the element; and
+  `put struct_vector[2] {}` appends a zeroed element where the vector holds
+  two. A vector of structs grows as any vector does, zero-padding, and pads
+  a new element's unnamed members with zero. `put struct_vector [{...}]`
+  replaces every element, each naming every member; see
+  [design.md](design.md#vectors-of-structs). An element of an array of
+  structs is not written.
 
 Intermediate objects along the path are created as needed, so
 `put a.b.c 1` on an empty table yields `{"a":{"b":{"c":1}}}`.
@@ -146,9 +160,11 @@ as success keeps its source only for a lone `delete`: a patch answering
 `NotStored` made none of its edits. An empty patch names no edit, and is
 applied as a copy.
 
-The patched object must be a table or a struct that a `put` could reach: a
-whole vector, a vector or array of structs or an element of one, and a union
-with no member named are refused, even for a patch holding only deletes.
+The patched object must be a table or a struct that a `put` could reach,
+an element of a vector of structs included
+(`patch struct_vector[1] { put i8 5 ; put i16 6 }`): a whole vector, an array
+of structs or an element of one, and a union with no member named are
+refused, even for a patch holding only deletes.
 
 ## Applying a request
 

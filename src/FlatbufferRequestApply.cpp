@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -270,6 +271,80 @@ static std::optional<std::vector<uint8_t>> buildStructImage(
   return image;
 }
 
+// ---------------------------------------------------------------------------
+// Vectors of structs
+//
+// A vector of structs holds its elements inline, each the struct's bytes at
+// its size, so the vector is rebuilt whole around any element a request
+// writes: each element is an image as a struct field is, and the vector is
+// laid out at the struct's alignment, or what the field's attributes ask.
+// ---------------------------------------------------------------------------
+
+// Builds the vector `fieldDef` names from `elements`, a whole-vector payload
+// the classify pass accepted (see writeStructVectorPayload).
+static uoffset_t createStructVector(FlatBufferBuilder& fbb,
+                                    const reflection::Schema* schema,
+                                    const reflection::Field* fieldDef,
+                                    const reflection::Object* structDef,
+                                    flexbuffers::Vector elements) {
+  const auto size = static_cast<size_t>(structDef->bytesize());
+  auto image = std::vector<uint8_t>(size);
+  fbb.StartVector(elements.size(), size, vectorAlignment(schema, fieldDef));
+  for (auto i = elements.size(); i > 0;) {
+    std::ranges::fill(image, uint8_t{0});
+    [[maybe_unused]] const auto written =
+        writeStructVectorPayload(schema, structDef, image, elements[--i]);
+    assert(written);
+    fbb.PushBytes(image.data(), size);
+  }
+  return fbb.EndVector(elements.size());
+}
+
+// Rebuilds the vector of structs `fieldDef` names in `sourceTable` with
+// `payload` written into element `path.front()` at the member the rest of
+// `path` names, or into the element by map where it names none. An index at
+// or past the end grows the vector to reach it, the elements between zeroed,
+// as are the members of the new element the payload does not name.
+static uoffset_t applyRequestPut_GenerateStructVectorOffset(
+    FlatBufferBuilder& fbb, const reflection::Schema* schema,
+    const reflection::Field* fieldDef, const reflection::Object* structDef,
+    const Table* sourceTable, std::span<const uint32_t> path,
+    std::span<const uint8_t> payload) {
+  const auto* vector = getFieldVA(sourceTable, fieldDef);
+  const auto index = size_t{path.front()};
+  if (not structVectorCanGrowTo(structDef, index, fbb.GetSize())) {
+    return 0;
+  }
+  const auto size = static_cast<size_t>(structDef->bytesize());
+  const auto existingSize = (vector != nullptr) ? size_t{vector->size()} : 0;
+  const auto* data = (vector != nullptr) ? vector->Data() : nullptr;
+  auto image = std::vector<uint8_t>(size, uint8_t{0});
+  if (index < existingSize) {
+    std::memcpy(image.data(), data + (index * size), size);
+  }
+  if (not writeStructElementPayload(schema, structDef, image, path.subspan(1),
+                                    payloadFlexRoot(payload))) {
+    return 0;
+  }
+  const auto newSize = std::max(existingSize, index + 1);
+  fbb.StartVector(newSize, size, vectorAlignment(schema, fieldDef));
+  // Pushed back to front: the elements after the one written, it, the zeroed
+  // elements between the stored ones and it, and the elements before it.
+  if (existingSize > index + 1) {
+    fbb.PushBytes(data + ((index + 1) * size),
+                  (existingSize - index - 1) * size);
+  }
+  fbb.PushBytes(image.data(), size);
+  std::ranges::fill(image, uint8_t{0});
+  for (auto i = existingSize; i < index; i++) {
+    fbb.PushBytes(image.data(), size);
+  }
+  if (existingSize > 0) {
+    fbb.PushBytes(data, std::min(existingSize, index) * size);
+  }
+  return fbb.EndVector(newSize);
+}
+
 static uoffset_t copyPayload(FlatBufferBuilder& fbb,
                              const reflection::Schema* schema,
                              const reflection::Field* fieldDef,
@@ -315,6 +390,12 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
           strings[i] = std::string_view(str.c_str(), str.length());
         }
         return fbb.CreateVectorOfStrings(strings.begin(), strings.end()).o;
+      }
+      if (fieldDef->type()->element() == reflection::Obj
+          and schema->objects()->Get(fieldDef->type()->index())->is_struct()) {
+        return createStructVector(
+            fbb, schema, fieldDef,
+            schema->objects()->Get(fieldDef->type()->index()), vector);
       }
       if (fieldDef->type()->element() == reflection::Obj) {
         auto tables = std::vector<Offset<Table>>{};
@@ -490,7 +571,8 @@ static uoffset_t applyRequestPut_GenerateObjectVectorOffset(
     bool useStringPooling) {
   const auto* subtableDef = schema->objects()->Get(fieldDef->type()->index());
   if (subtableDef->is_struct()) {
-    return 0;
+    return applyRequestPut_GenerateStructVectorOffset(
+        fbb, schema, fieldDef, subtableDef, sourceTable, path, payload);
   }
   const auto* vector = getFieldVT(sourceTable, fieldDef);
   const auto existingSize = (vector != nullptr) ? vector->size() : uoffset_t{0};
@@ -1299,16 +1381,29 @@ static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
   const auto* elementDef = (elementType == reflection::Obj)
                                ? schema->objects()->Get(type->index())
                                : nullptr;
-  if (elementDef != nullptr and elementDef->is_struct()) {
-    // A struct element is inline, and nothing builds one.
-    return ApplyOutcome::Refused;
-  }
   if (type->base_type() == reflection::Vector64
       or (isWideOffsetField(fieldDef) and not rest.empty())) {
     // A vector held through a 64-bit offset with a 32-bit length is written
     // whole; its elements, and a vector with a 64-bit length, are read and
     // written through 32-bit accessors.
     return ApplyOutcome::Refused;
+  }
+  if (elementDef != nullptr and elementDef->is_struct()) {
+    if (rest.empty()) {
+      return appliedIf(flexPayloadFits(payload, [&](auto root) {
+        return payloadFits(schema, type, false, root)
+               and structVectorCanHold(elementDef, root.AsVector().size(),
+                                       bytesBuilt);
+      }));
+    }
+    if (not structVectorCanGrowTo(elementDef, rest.front(), bytesBuilt)) {
+      return ApplyOutcome::Refused;
+    }
+    return appliedIf(flexPayloadFits(payload, [&](auto root) {
+      auto image = std::vector<uint8_t>(elementDef->bytesize());
+      return writeStructElementPayload(schema, elementDef, image,
+                                       rest.subspan(1), root);
+    }));
   }
   if (rest.empty()) {
     if (elementType == reflection::Union) {

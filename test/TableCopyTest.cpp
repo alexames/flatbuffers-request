@@ -53,6 +53,7 @@ constexpr auto kSchema = R"fbs(
     aligned: [ubyte] (force_align: 16);
     nested: [ubyte] (nested_flatbuffer: "Leaf");
     leaves: [Leaf];
+    wides32: [Wide] (offset64);
   }
 
   table Root {
@@ -767,6 +768,66 @@ TEST_F(TableCopyTest, WritesOrRefusesAFieldHeldThroughA64BitOffset) {
   EXPECT_TRUE(refused(initial, "delete holder.bytes64[0]"));
   EXPECT_TRUE(refused(initial, R"(put holder.wides64 [{"a": 1, "b": 2}])"));
   EXPECT_TRUE(refused(initial, "delete holder.wides64[0]"));
+}
+
+// A vector of structs held through a 64-bit offset with a 32-bit length is
+// written whole through that offset, as a vector of scalars is; its elements
+// are read through 32-bit accessors, so a request naming one is refused.
+TEST_F(TableCopyTest, WritesAVectorOfStructsHeldThroughA64BitOffsetWhole) {
+  const auto initial = source();
+  const auto bytes =
+      applied(initial, R"(put holder.wides32 [{"a": 3, "b": 4}, {"a": 5, )"
+                       R"("b": -6}])");
+  const auto* holder = subtable(flatbuffers::GetAnyRoot(bytes.data()),
+                                "copy_test.Root", "holder");
+  const auto* wides =
+      holder->GetPointer<const uint8_t*, flatbuffers::uoffset64_t>(
+          field("copy_test.Holder", "wides32"));
+  ASSERT_NE(wides, nullptr);
+  EXPECT_EQ(flatbuffers::ReadScalar<uint32_t>(wides), 2U);
+  EXPECT_TRUE(alignedIn(bytes, wides + 4, 8));
+  expectWide(wides + 4, 3, 4);
+  expectWide(wides + 20, 5, -6);
+  EXPECT_TRUE(refused(bytes, "put holder.wides32[0].a 1"));
+  EXPECT_TRUE(refused(bytes, "put holder.wides32[2] {}"));
+  EXPECT_TRUE(refused(bytes, "delete holder.wides32[0]"));
+}
+
+// A vector of structs keeps its struct's alignment, 8 bytes for one holding
+// an int64 and 16 for one forced there, wherever an edit of it lands.
+TEST_F(TableCopyTest, KeepsAVectorOfStructsAlignedWhereAnEditRebuildsIt) {
+  const auto shapes = std::array{Shape::kAlignedStructs, Shape::kForcedStructs};
+  const auto initial = source(shapes, shapes, shapes);
+  const auto expectAligned = [&](const std::vector<uint8_t>& bytes,
+                                 const char* name, size_t alignment) {
+    const auto* holder = subtable(flatbuffers::GetAnyRoot(bytes.data()),
+                                  "copy_test.Root", "holder");
+    const auto* vector = holder->GetPointer<const flatbuffers::VectorOfAny*>(
+        field("copy_test.Holder", name));
+    ASSERT_NE(vector, nullptr) << name;
+    if (vector->size() != 0) {
+      EXPECT_TRUE(alignedIn(bytes, vector->Data(), alignment)) << name;
+    }
+  };
+  for (auto length = 0; length < 16; length++) {
+    const auto filler = "put filler \"" + std::string(length, 'p') + "\"";
+    SCOPED_TRACE(filler);
+    const auto padded = applied(initial, filler);
+    for (const auto* request : {
+             "put holder.wides[0].a 9",
+             "put holder.wides[3] {}",
+             R"(put holder.wides [{"a": 1, "b": 2}])",
+             "delete holder.wides[0]",
+             "put holder.forced[0].a 9",
+             R"(put holder.forced[2] {"a": 4})",
+             R"(put holder.forced [{"a": 1}, {"a": 2}])",
+         }) {
+      SCOPED_TRACE(request);
+      const auto bytes = applied(padded, request);
+      expectAligned(bytes, "wides", 8);
+      expectAligned(bytes, "forced", 16);
+    }
+  }
 }
 
 // A vector the schema asks to align keeps that alignment when an edit

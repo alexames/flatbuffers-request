@@ -69,13 +69,47 @@ payload into that image, and pushes it inline.
   map or array for a scalar. The parser decides all of this from the schema
   alone; the apply refuses a hand-built request carrying one.
 
+### Vectors of structs
+
+A vector of structs holds its elements inline too, each the struct's bytes at
+its size, with no offset per element. Apply rebuilds the whole vector around
+the element a request writes, at the struct's alignment or what the field's
+`force_align` asks, the element built as an image as a struct field is:
+
+- **A member of an element** (`put struct_vector[1].i8 5`, through nested
+  structs and into an array, `put holder_vector[1].inner.arr[2] 7`) is
+  written into the stored element's image, as a struct field's member is.
+- **An element by map** (`put struct_vector[1] {"i8": 5}`) writes the members
+  the map names, and the rest of the element keeps what it stores. An empty
+  map names the element alone, which a struct field's map does not:
+  `put struct_vector[n] {}`, with `n` the vector's length, appends a zeroed
+  element, and it is how a vector the buffer does not store is started
+  element by element. On an element the vector stores it changes nothing,
+  and is applied, as a put of the value a field holds is.
+- **An index past the end** grows the vector to reach it, as every vector
+  does, with the elements between zeroed: a struct the buffer does not store
+  reads as zeroes. A vector grows, and a whole put builds one, only as far
+  as the struct's size per element lets it fit in a flatbuffer.
+- **The vector whole** (`put struct_vector [{...}, ...]`) replaces every
+  element, so there is no stored element for a member the value leaves out to
+  keep: each element names every member exactly once, a nested struct every
+  member of its own, and a fixed-length array every element. A member
+  missing, undeclared or named twice is refused rather than written as zero.
+  `[]` stores the vector empty.
+- **A `patch` of an element** (`patch struct_vector[1] { put i8 5 ; put i16 6 }`)
+  applies its puts to it in turn. A delete inside an element is refused, as
+  inside any struct; `delete struct_vector[1]` removes the element, closing
+  the gap.
+
+### What a put refuses
+
 A `put` is REFUSED, rather than served wrongly, for:
 
-- an element of a vector or array **of structs** (`put struct_vector[0].i8 5`,
-  `put nested.structs[0].a 2`) and a whole vector or array of structs, and a
-  `patch` of one, whose operations would be puts into it. A struct element
-  is inline: apply builds no offset for one while the table builder still
-  consumes one, which would read a neighbouring field's offset.
+- an element of an array **of structs** inside a struct
+  (`put nested.structs[0].a 2`, `put nested_vector[0].structs [...]`), and a
+  `patch` of one. The struct writer computes no stride for one, so no value
+  writes such an array, and a whole put of a vector of structs holding one
+  takes only `[]`. The members beside the array are written as any member is.
 - a whole vector of **unions**, whose element types live in a second vector
   that a JSON array cannot carry.
 - a payload of the wrong kind for its field — a string where a number belongs
@@ -89,12 +123,9 @@ than FlatBuffers' flexbuffer parser, which reads a numeral past the signed
 64-bit range as 0: a uint64 above 2^63 - 1 would be written as 0, and an
 out-of-range value could not be told from a 0 the request spelled.
 
-A `delete` is unaffected by those refusals: removing a whole element is well
-defined where writing one is not, so `delete struct_vector[0]` still works.
-
-A struct payload is carried as a **flexbuffer map**, not as a table: a struct
-cannot be a parser root type, and apply writes its members by name into the
-image.
+A struct payload, and each element of a whole vector of structs, is carried
+as a **flexbuffer map**, not as a table: a struct cannot be a parser root
+type, and apply writes its members by name into the image.
 
 ## Coupling to FlatBuffers internals
 
