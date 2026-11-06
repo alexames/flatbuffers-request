@@ -4,6 +4,7 @@
 #include <string>
 
 #include "ElementIndex.hpp"
+#include "PayloadValue.hpp"
 #include "StringScan.hpp"
 #include "fbrequest/FlatbufferRequest.hpp"
 #include "flatbuffers/flatbuffers.h"
@@ -100,11 +101,14 @@ bool isUnionDiscriminator(const reflection::Field* field) {
 // `writing` refuses the paths only a `put` cannot serve, for a put and for a
 // patch, whose operations may be puts: a delete resolves the same text and
 // removes a whole element, which is well defined where writing one is not.
+// `outInsideStruct` is set where the path names a member of a struct, which
+// a delete cannot remove.
 std::optional<Offset<Vector<uint32_t>>> parseFlatbufferOffsetPath(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
     std::string_view* path, const reflection::Type** outType,
     const reflection::Object** outObject, bool* outElementInVector,
-    const reflection::Object* startObject = nullptr, bool writing = false) {
+    const reflection::Object* startObject = nullptr, bool writing = false,
+    bool* outInsideStruct = nullptr) {
   *outType = nullptr;
   // Paths inside a patch's nested operations are relative to the patched
   // subobject rather than the root table.
@@ -121,6 +125,9 @@ std::optional<Offset<Vector<uint32_t>>> parseFlatbufferOffsetPath(
     *outElementInVector = false;
     if (*outObject == nullptr) {
       return std::nullopt;
+    }
+    if ((*outObject)->is_struct() and outInsideStruct != nullptr) {
+      *outInsideStruct = true;
     }
 
     const auto fieldName = path->substr(0, findAnyOf(*path, ".[ "));
@@ -319,20 +326,30 @@ bool payloadTypeAccepts(reflection::BaseType payloadType,
 
 std::optional<Offset<Put>> parseFlatbufferPut_ParsePrimitive(
     FlatBufferBuilder& fbb, std::string_view* requestString,
-    Offset<Vector<uint32_t>>& offsets, reflection::BaseType payloadType) {
+    const reflection::Schema* schema, Offset<Vector<uint32_t>>& offsets,
+    const reflection::Type* type, bool elementInVector) {
   auto parser = Parser{};
   if (not parser.ParseFlexBuffer(requestString->data(), nullptr,
                                  &parser.flex_builder_)) {
     return std::nullopt;
   }
+  const auto root = flexbuffers::GetRoot(parser.flex_builder_.GetBuffer());
   // A scalar field takes a number. An enum is a scalar, and its NAME is not
   // accepted: apply reads a string as a number, which answers 0 for every
   // name, so accepting one here would write a wrong value rather than refuse
   // a wrong request.
-  if (not payloadTypeAccepts(
-          payloadType,
-          flexbuffers::GetRoot(parser.flex_builder_.GetBuffer().data(),
-                               parser.flex_builder_.GetBuffer().size()))) {
+  const auto payloadType =
+      elementInVector ? type->element() : type->base_type();
+  if (not payloadTypeAccepts(payloadType, root)) {
+    return std::nullopt;
+  }
+  // A struct, or an array in one, has to take its payload whole: a put that
+  // writes none of it, or drops part of it, is refused.
+  const auto structOrArray =
+      type->base_type() == reflection::Array
+      or (payloadType == reflection::Obj
+          and schema->objects()->Get(type->index())->is_struct());
+  if (structOrArray and not payloadFits(schema, type, elementInVector, root)) {
     return std::nullopt;
   }
   // Advance past the parsed payload so a caller (e.g. a patch's update list)
@@ -384,10 +401,8 @@ std::optional<Offset<Put>> parseFlatbufferPut(
   }
   // An element's payload is one of the element type; anything else is a
   // payload of the field's own type, including a whole vector or array.
-  const auto payloadType =
-      elementInVector ? type->element() : type->base_type();
-  return parseFlatbufferPut_ParsePrimitive(fbb, requestString, *offsets,
-                                           payloadType);
+  return parseFlatbufferPut_ParsePrimitive(fbb, requestString, schema, *offsets,
+                                           type, elementInVector);
 }
 
 // Parses `<path> { <op> ; <op> ; ... }`, where each <op> is a put/patch/delete
@@ -465,10 +480,13 @@ std::optional<Offset<Delete>> parseFlatbufferDelete(
   const reflection::Type* type = nullptr;
   const reflection::Object* object = nullptr;
   bool elementInVector = false;
-  auto offsets =
-      parseFlatbufferOffsetPath(fbb, schema, requestString, &type, &object,
-                                &elementInVector, startObject);
-  if (not offsets) {
+  bool insideStruct = false;
+  auto offsets = parseFlatbufferOffsetPath(
+      fbb, schema, requestString, &type, &object, &elementInVector, startObject,
+      /*writing=*/false, &insideStruct);
+  // A struct's members are all always stored, so there is no member, nor
+  // element of an array in one, to remove.
+  if (not offsets or insideStruct) {
     return std::nullopt;
   }
   return CreateDelete(fbb, *offsets);

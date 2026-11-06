@@ -47,6 +47,7 @@ cpp_library(
     SOURCES
         "FlatbufferRequestApply.cpp"
         "FlatbufferRequestParse.cpp"
+        "PayloadValue.cpp"
         "StringScan.cpp"
     HEADERS
         "fbrequest/FlatbufferRequest.hpp"

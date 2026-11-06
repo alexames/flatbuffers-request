@@ -57,7 +57,7 @@ cat player.bin | fbrequest -s player.bfbs 'patch { put i8 5 ; delete title }' > 
 | Code | Meaning |
 |------|---------|
 | `0` | Success. |
-| `1` | Runtime failure (I/O error, invalid schema/input, malformed request). |
+| `1` | Runtime failure (I/O error, invalid schema/input, malformed request, or a request that does not make the edit it names, such as a delete of something the input does not store). |
 | `2` | Usage error (bad or missing arguments). |
 
 The tool verifies both the schema and the input buffer before applying a

@@ -115,9 +115,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
       return 0;
     }
     flatbuffers::FlatBufferBuilder fbb;
-    fbb.Finish(fbrequest::applyRequest(
+    const auto applied = fbrequest::tryApplyRequest(
         fbb, schema, flatbuffers::GetAnyRoot(emptyRoot().data()),
-        flatbuffers::GetRoot<serialized::Request>(parsed->data())));
+        flatbuffers::GetRoot<serialized::Request>(parsed->data()));
+    if (applied.outcome == fbrequest::ApplyOutcome::Applied) {
+      fbb.Finish(applied.root);
+    }
   }
   return 0;
 }

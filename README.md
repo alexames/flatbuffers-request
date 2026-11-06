@@ -56,21 +56,24 @@ void bump_health(const reflection::Schema* schema,
   if (!request) return;  // malformed request
 
   flatbuffers::FlatBufferBuilder fbb;
-  fbb.Finish(fbrequest::applyRequest(
+  const auto applied = fbrequest::tryApplyRequest(
       fbb, schema,
       flatbuffers::GetAnyRoot(current.data()),
-      flatbuffers::GetRoot<serialized::Request>(request->data())));
+      flatbuffers::GetRoot<serialized::Request>(request->data()));
+  if (applied.outcome != fbrequest::ApplyOutcome::Applied) return;
+  fbb.Finish(applied.root);
 
   // fbb.GetBufferPointer() / fbb.GetSize() now hold the updated buffer.
 }
 ```
 
-The public API is three functions in namespace `fbrequest` ([include/fbrequest/FlatbufferRequest.hpp](include/fbrequest/FlatbufferRequest.hpp)):
+The public API is in namespace `fbrequest` ([include/fbrequest/FlatbufferRequest.hpp](include/fbrequest/FlatbufferRequest.hpp)):
 
 | Function | Purpose |
 |----------|---------|
 | `parseFlatbufferRequest(schema, text)` | Parse request text into a serialized `Request` buffer (`std::nullopt` if malformed). |
-| `applyRequest(fbb, schema, source, request)` | Apply a parsed request to `source`, building the result into `fbb`. |
+| `tryApplyRequest(fbb, schema, source, request)` | Apply a parsed request to `source`, building the result into `fbb` only where every operation makes the edit it names. Answers `Applied`, `NotStored` (a delete of something the buffer does not store) or `Refused`. |
+| `applyRequest(fbb, schema, source, request)` | As `tryApplyRequest`, answering only the root: null where nothing was built. |
 | `copyTable(fbb, schema, ptr, pool)` | Deep-copy a table by reflection (the primitive `applyRequest` builds on). |
 
 ## Request language
@@ -78,7 +81,7 @@ The public API is three functions in namespace `fbrequest` ([include/fbrequest/F
 See [docs/grammar.md](docs/grammar.md) for the full grammar. In brief:
 
 - **`put <path> <value>`** — set a scalar, string, table, union member, vector, or vector element. Missing intermediate objects/elements are created; vectors grow (zero/empty-padded) as needed.
-- **`delete <path>`** — remove a field, a whole vector, or one vector element. Deleting an absent field is a no-op.
+- **`delete <path>`** — remove a field, a whole vector, or one vector element. Deleting something the buffer does not store builds nothing and answers `NotStored`.
 - **`patch <path> { <op> ; <op> ; ... }`** — apply a sequence of operations relative to the object at `<path>` (empty path patches the target directly). Patches nest.
 
 Paths are dotted field names with `[i]` for vector indices and `.MemberName` for union members, e.g. `number.Integer.value`, `object_vector[2].name`.

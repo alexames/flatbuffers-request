@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "ElementIndex.hpp"
+#include "PayloadValue.hpp"
 #include "fbrequest/FlatbufferRequest.hpp"
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/idl.h"
@@ -249,74 +250,6 @@ static void copyInline(FlatBufferBuilder& fbb,
   fbb.TrackField(fieldDef->offset(), fbb.GetSize());
 }
 
-static void getFlexbufferScalarDataPointer(flexbuffers::Reference reference,
-                                           reflection::BaseType type,
-                                           std::array<uint8_t, 8>* bytes) {
-  switch (type) {
-    case reflection::Bool: {
-      auto val = reference.AsBool();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::Byte: {
-      auto val = reference.AsInt8();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::UType:
-    case reflection::UByte: {
-      auto val = reference.AsUInt8();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::Short: {
-      auto val = reference.AsInt16();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::UShort: {
-      auto val = reference.AsUInt16();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::Int: {
-      auto val = reference.AsInt32();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::UInt: {
-      auto val = reference.AsUInt32();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::Long: {
-      auto val = reference.AsInt64();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::ULong: {
-      auto val = reference.AsUInt64();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::Float: {
-      auto val = reference.AsFloat();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    case reflection::Double: {
-      auto val = reference.AsDouble();
-      std::memcpy(bytes->data(), &val, sizeof(val));
-      return;
-    }
-    default: {
-      assert(false);
-    }
-  }
-}
-
-// TODO: Clean this up. Does it need to be one giant function?
-// This should probably be refactored.
 // ---------------------------------------------------------------------------
 // Structs
 //
@@ -328,171 +261,10 @@ static void getFlexbufferScalarDataPointer(flexbuffers::Reference reference,
 // zeroes, which is what every member of an absent struct reads as.
 // ---------------------------------------------------------------------------
 
-// The member of `structDef` stored at `offset` bytes into it.
-static const reflection::Field* structFieldAtOffset(
-    const reflection::Object* structDef, uint32_t offset) {
-  for (const auto* fieldDef : *structDef->fields()) {
-    if (fieldDef->offset() == offset) {
-      return fieldDef;
-    }
-  }
-  return nullptr;
-}
-
-// Whether a flexbuffer value is the kind a scalar member can take. Anything
-// else -- a string, a map, a vector -- is converted rather than refused by
-// `writeScalarInto`, which answers a wrong number instead of a wrong request.
-static bool holdsAScalar(flexbuffers::Reference value) {
-  return not value.IsString() and not value.IsMap() and not value.IsVector()
-         and not value.IsTypedVector() and not value.IsFixedTypedVector()
-         and not value.IsBlob();
-}
-
-static void writeScalarInto(flexbuffers::Reference value,
-                            reflection::BaseType type, std::span<uint8_t> at) {
-  auto bytes = std::array<uint8_t, 8>{};
-  getFlexbufferScalarDataPointer(value, type, &bytes);
-  const auto size = GetTypeSize(type);
-  if (at.size() < size) {
-    return;
-  }
-  std::memcpy(at.data(), bytes.data(), size);
-}
-
-// What writing a payload into a struct image came to. "Nothing" is not a
-// failure: a map naming no member the struct declares asked for nothing, and
-// the members BESIDE it are still written. It is only where nothing at all
-// was written that the caller leaves the field alone, so a payload that wrote
-// nothing does not create a struct of zeroes.
-enum class StructWrite { Rejected, Nothing, Wrote };
-
-static StructWrite writeStructMember(const reflection::Schema* schema,
-                                     const reflection::Object* structDef,
-                                     std::span<uint8_t> image,
-                                     std::span<const uint32_t> path,
-                                     flexbuffers::Reference value);
-
-// Writes every member `map` names into `image`, leaving the rest as they were.
-// A name the struct does not declare is ignored rather than refusing the whole
-// map: the payload is parsed as a flexbuffer, which cannot be checked against
-// the schema until here, and a struct has no way to carry an unknown member.
-//
-// Answers `Nothing` where it wrote nothing, so that a map naming no member
-// the struct declares -- an empty one included -- does not count as a write.
-// The caller leaves the field as it was, which is what keeps such a payload
-// from creating a struct of zeroes where the buffer had none. A member whose
-// own payload writes nothing is skipped; only a `Rejected` one, whose payload
-// the struct cannot take at all, refuses the map around it.
-static StructWrite writeStructMap(const reflection::Schema* schema,
-                                  const reflection::Object* structDef,
-                                  std::span<uint8_t> image,
-                                  flexbuffers::Map map) {
-  auto keys = map.Keys();
-  auto values = map.Values();
-  auto wroteAMember = false;
-  for (size_t i = 0; i < keys.size(); i++) {
-    const auto* fieldDef = structDef->fields()->LookupByKey(keys[i].AsKey());
-    if (fieldDef == nullptr) {
-      continue;
-    }
-    const auto memberOffset = uint32_t{fieldDef->offset()};
-    const auto written = writeStructMember(
-        schema, structDef, image, std::span{&memberOffset, 1}, values[i]);
-    if (written == StructWrite::Rejected) {
-      return StructWrite::Rejected;
-    }
-    wroteAMember = wroteAMember or written == StructWrite::Wrote;
-  }
-  return wroteAMember ? StructWrite::Wrote : StructWrite::Nothing;
-}
-
-// Writes `value` into the member `path` names, `path` being byte offsets into
-// successively nested structs and, for a fixed-length array, the element
-// index. An empty `path` means `value` is a map of the whole struct.
-static StructWrite writeStructMember(const reflection::Schema* schema,
-                                     const reflection::Object* structDef,
-                                     std::span<uint8_t> image,
-                                     std::span<const uint32_t> path,
-                                     flexbuffers::Reference value) {
-  if (path.empty()) {
-    if (not value.IsMap()) {
-      return StructWrite::Rejected;
-    }
-    return writeStructMap(schema, structDef, image, value.AsMap());
-  }
-  const auto* fieldDef = structFieldAtOffset(structDef, path.front());
-  if (fieldDef == nullptr or fieldDef->offset() >= image.size()) {
-    return StructWrite::Rejected;
-  }
-  auto at = image.subspan(fieldDef->offset());
-  const auto baseType = fieldDef->type()->base_type();
-  const auto rest = path.subspan(1);
-
-  if (baseType == reflection::Obj) {
-    const auto* nested = schema->objects()->Get(fieldDef->type()->index());
-    return writeStructMember(schema, nested, at.first(nested->bytesize()), rest,
-                             value);
-  }
-  if (baseType == reflection::Array) {
-    const auto elementType = fieldDef->type()->element();
-    if (not IsScalar(elementType)) {
-      // An array of structs: `GetTypeSize` answers a pointer's width for one,
-      // not the struct's, so every element would be written at the wrong
-      // stride. Nothing writes one, so nothing is written.
-      return StructWrite::Rejected;
-    }
-    const auto elementSize = GetTypeSize(elementType);
-    const auto length = size_t{fieldDef->type()->fixed_length()};
-    if (rest.empty()) {
-      // The whole array, as a flexbuffer vector. A shorter one leaves the
-      // elements it does not reach; a longer one is refused, because a
-      // fixed-length array cannot grow.
-      if (not value.IsVector()) {
-        return StructWrite::Rejected;
-      }
-      auto elements = value.AsVector();
-      if (elements.size() > length) {
-        return StructWrite::Rejected;
-      }
-      if (elements.size() == 0) {
-        // An empty vector reaches no element, so it writes nothing -- the
-        // same as a map naming no member, and not a reason to create a
-        // struct of zeroes.
-        return StructWrite::Nothing;
-      }
-      for (size_t i = 0; i < elements.size(); i++) {
-        writeScalarInto(elements[static_cast<int>(i)], elementType,
-                        at.subspan(i * elementSize));
-      }
-      return StructWrite::Wrote;
-    }
-    const auto index = size_t{rest.front()};
-    if (index >= length or rest.size() != 1) {
-      return StructWrite::Rejected;
-    }
-    writeScalarInto(value, elementType, at.subspan(index * elementSize));
-    return StructWrite::Wrote;
-  }
-  if (not rest.empty() or not IsScalar(baseType)) {
-    return StructWrite::Rejected;
-  }
-  if (not holdsAScalar(value)) {
-    // `writeScalarInto` converts whatever it is given: a string reads as 0 (or
-    // as the number it spells), and a vector reads as its LENGTH. A member
-    // named in a map has to be checked here, because the request parser sees
-    // only the map and cannot tell which key goes to which type.
-    return StructWrite::Rejected;
-  }
-  writeScalarInto(value, baseType, at);
-  return StructWrite::Wrote;
-}
-
 // The image of the struct `fieldDef` names after `payload` is written into it
 // at `path`: the source's bytes where the buffer stores one, zeroes where it
-// does not. EMPTY where the payload wrote nothing, whether because the struct
-// cannot take it -- a fixed-length array too long for its field, say -- or
-// because it named nothing, so that a request which writes nothing does not
-// leave a struct of zeroes where there was none.
+// does not. Empty where the struct cannot take the payload (see
+// writeStructPayload), which `classifyPut` refuses before anything is built.
 static std::optional<std::vector<uint8_t>> buildStructImage(
     const reflection::Schema* schema, const reflection::Object* structDef,
     const reflection::Field* fieldDef, const Table* sourceTable,
@@ -507,8 +279,7 @@ static std::optional<std::vector<uint8_t>> buildStructImage(
     }
   }
   const auto value = payloadFlexRoot(payload);
-  if (writeStructMember(schema, structDef, image, path, value)
-      != StructWrite::Wrote) {
+  if (not writeStructPayload(schema, structDef, image, path, value)) {
     return std::nullopt;
   }
   return image;
@@ -545,8 +316,7 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
         fbb.StartVector(vector.size(), elementSize, elementSize);
         for (auto i = vector.size(); i > 0;) {
           fbb.Align(elementSize);
-          std::array<uint8_t, 8> bytes{};
-          getFlexbufferScalarDataPointer(vector[--i], elementType, &bytes);
+          const auto bytes = scalarBytes(vector[--i], elementType);
           fbb.PushBytes(bytes.data(), elementSize);
         }
         return fbb.EndVector(vector.size());
@@ -628,8 +398,7 @@ static void copyOperationScalar(FlatBufferBuilder& fbb,
                                 size_t size) {
   auto baseType = fieldDef->type()->base_type();
   auto root = payloadFlexRoot(payload);
-  auto bytes = std::array<uint8_t, 8>{};
-  getFlexbufferScalarDataPointer(root, baseType, &bytes);
+  const auto bytes = scalarBytes(root, baseType);
 
   fbb.Align(align);
   fbb.PushBytes(bytes.data(), size);
@@ -683,8 +452,7 @@ static uoffset_t applyRequestPut_GenerateScalarVectorOffset(
 
   // Add the new element itself.
   auto root = payloadFlexRoot(payload);
-  auto bytes = std::array<uint8_t, 8>{};
-  getFlexbufferScalarDataPointer(root, elementBaseType, &bytes);
+  const auto bytes = scalarBytes(root, elementBaseType);
   fbb.PushBytes(bytes.data(), elementSize);
 
   // If the new element is beyond the edge, insert 0's to pad the vector.
@@ -1356,6 +1124,384 @@ uoffset_t applyRequestPut(FlatBufferBuilder& fbb,
 }
 
 // ---------------------------------------------------------------------------
+// Classification
+//
+// A request's path is resolved against the schema and the buffer before
+// anything is built, so that one which does not make the edit it names leaves
+// the caller's builder as it was. The builders below assume a request this
+// classified Applied.
+// ---------------------------------------------------------------------------
+
+using fbrequest::ApplyOutcome;
+
+// The field of `objectDef` at vtable offset (or, in a struct, byte offset)
+// `offset`, or null where it declares none.
+static const reflection::Field* fieldAtOffset(
+    const reflection::Object* objectDef, uint32_t offset) {
+  for (const auto* fieldDef : *objectDef->fields()) {
+    if (fieldDef->offset() == offset) {
+      return fieldDef;
+    }
+  }
+  return nullptr;
+}
+
+// A union's discriminator, or a vector of unions' vector of them, which is
+// written only with the union beside it.
+static bool isDiscriminator(const reflection::Field* fieldDef) {
+  const auto* type = fieldDef->type();
+  return type->base_type() == reflection::UType
+         or (type->base_type() == reflection::Vector
+             and type->element() == reflection::UType);
+}
+
+// Whether `table` stores the field `fieldDef` names; false for a null `table`.
+static bool storesField(const Table* table, const reflection::Field* fieldDef) {
+  return table != nullptr and table->CheckField(fieldDef->offset());
+}
+
+// The table `fieldDef` names in `table`, or null where `table` is null or does
+// not store the field.
+static const Table* storedSubtable(const Table* table,
+                                   const reflection::Field* fieldDef) {
+  return storesField(table, fieldDef) ? GetFieldT(*table, *fieldDef) : nullptr;
+}
+
+// Whether `payload` is a well-formed flexbuffer whose root `fits` accepts. A
+// hand-built payload is read only once it verifies.
+template <typename Fits>
+static bool flexPayloadFits(std::span<const uint8_t> payload, Fits fits) {
+  return not payload.empty()
+         and flexbuffers::VerifyBuffer(payload.data(), payload.size())
+         and fits(payloadFlexRoot(payload));
+}
+
+static ApplyOutcome appliedIf(bool applied) {
+  return applied ? ApplyOutcome::Applied : ApplyOutcome::Refused;
+}
+
+static ApplyOutcome storedIf(bool stored) {
+  return stored ? ApplyOutcome::Applied : ApplyOutcome::NotStored;
+}
+
+static ApplyOutcome classifyDelete(const reflection::Schema* schema,
+                                   const reflection::Object* tableDef,
+                                   const Table* table,
+                                   std::span<const uint32_t> path);
+
+// `rest` is the path past `fieldDef`, a vector field of `tableDef`; `table` is
+// null where the buffer stores no such vector.
+static ApplyOutcome classifyDeleteInVector(const reflection::Schema* schema,
+                                           const reflection::Object* tableDef,
+                                           const reflection::Field* fieldDef,
+                                           const Table* table,
+                                           std::span<const uint32_t> rest) {
+  if (rest.empty()) {
+    return storedIf(table != nullptr);
+  }
+  const auto index = rest.front();
+  const auto deeper = rest.subspan(1);
+  const auto elementType = fieldDef->type()->element();
+  if (elementType == reflection::Obj) {
+    const auto* elementDef = schema->objects()->Get(fieldDef->type()->index());
+    if (elementDef->is_struct()) {
+      // A struct cannot lose a member.
+      if (not deeper.empty()) {
+        return ApplyOutcome::Refused;
+      }
+      const auto* vector = getFieldVA(table, fieldDef);
+      return storedIf(vector != nullptr and index < vector->size());
+    }
+    const auto* vector = getFieldVT(table, fieldDef);
+    const auto* element = (vector != nullptr and index < vector->size())
+                              ? vector->Get(index)
+                              : nullptr;
+    return deeper.empty() ? storedIf(element != nullptr)
+                          : classifyDelete(schema, elementDef, element, deeper);
+  }
+  if (elementType == reflection::Union) {
+    const auto* vector = getFieldVT(table, fieldDef);
+    const auto* types =
+        getFieldVI<uint8_t>(table, getUnionTypeField(tableDef, fieldDef));
+    const auto held = vector != nullptr and types != nullptr
+                      and index < std::min(vector->size(), types->size());
+    if (deeper.empty()) {
+      return storedIf(held);
+    }
+    const auto member = deeper.front();
+    const auto* memberDef =
+        getUnionTableDefFromEnumIndex(schema, fieldDef, member);
+    if (memberDef == nullptr) {
+      return ApplyOutcome::Refused;
+    }
+    const auto holdsMember = held and types->Get(index) == member;
+    if (deeper.size() == 1) {
+      return storedIf(holdsMember);
+    }
+    return classifyDelete(schema, memberDef,
+                          holdsMember ? vector->Get(index) : nullptr,
+                          deeper.subspan(1));
+  }
+  // A scalar or a string, which holds nothing to delete.
+  if (not deeper.empty()) {
+    return ApplyOutcome::Refused;
+  }
+  const auto* vector = getFieldVA(table, fieldDef);
+  return storedIf(vector != nullptr and index < vector->size());
+}
+
+// What a delete along `path` comes to in `table`, a table of `tableDef` or
+// null where the buffer stores none. The path is checked against the schema
+// whether or not what it names is stored, so a delete the schema cannot serve
+// is Refused even where there is nothing to delete.
+static ApplyOutcome classifyDelete(const reflection::Schema* schema,
+                                   const reflection::Object* tableDef,
+                                   const Table* table,
+                                   std::span<const uint32_t> path) {
+  if (path.empty()) {
+    return ApplyOutcome::Refused;
+  }
+  const auto* fieldDef = fieldAtOffset(tableDef, path.front());
+  if (fieldDef == nullptr or isDiscriminator(fieldDef)) {
+    return ApplyOutcome::Refused;
+  }
+  const auto stored = storesField(table, fieldDef);
+  const auto rest = path.subspan(1);
+  const auto* type = fieldDef->type();
+  switch (type->base_type()) {
+    case reflection::Obj: {
+      const auto* subDef = schema->objects()->Get(type->index());
+      if (rest.empty()) {
+        return storedIf(stored);
+      }
+      if (subDef->is_struct()) {
+        return ApplyOutcome::Refused;
+      }
+      return classifyDelete(schema, subDef, storedSubtable(table, fieldDef),
+                            rest);
+    }
+    case reflection::Union: {
+      if (rest.empty()) {
+        return storedIf(stored);
+      }
+      const auto member = rest.front();
+      const auto* memberDef =
+          getUnionTableDefFromEnumIndex(schema, fieldDef, member);
+      if (memberDef == nullptr) {
+        return ApplyOutcome::Refused;
+      }
+      const auto held =
+          stored and storedUnionMember(tableDef, fieldDef, table) == member;
+      if (rest.size() == 1) {
+        return storedIf(held);
+      }
+      return classifyDelete(schema, memberDef,
+                            held ? GetFieldT(*table, *fieldDef) : nullptr,
+                            rest.subspan(1));
+    }
+    case reflection::Vector:
+      return classifyDeleteInVector(schema, tableDef, fieldDef,
+                                    stored ? table : nullptr, rest);
+    case reflection::Array:
+      return ApplyOutcome::Refused;
+    default:
+      return rest.empty() ? storedIf(stored) : ApplyOutcome::Refused;
+  }
+}
+
+static ApplyOutcome classifyPut(const reflection::Schema* schema,
+                                const reflection::Object* tableDef,
+                                const Table* table,
+                                std::span<const uint8_t> payload,
+                                std::span<const uint32_t> path,
+                                uoffset_t bytesBuilt);
+
+// Whether `payload` is a flatbuffer whose root is a table of `tableDef`,
+// which the builders copy with `CopyTable` and nothing else checks. `payload`
+// must already be aligned (see alignPayload).
+static bool tablePayloadFits(const reflection::Schema* schema,
+                             const reflection::Object* tableDef,
+                             std::span<const uint8_t> payload) {
+  return not payload.empty()
+         and flatbuffers::Verify(*schema, *tableDef, payload.data(),
+                                 payload.size());
+}
+
+// Whether a whole-vector payload for a vector of tables of `tableDef` is a
+// list of the flatbuffers that build its elements.
+static bool tableListFits(const reflection::Schema* schema,
+                          const reflection::Object* tableDef,
+                          flexbuffers::Reference root) {
+  if (root.GetType() != flexbuffers::FBT_VECTOR) {
+    return false;
+  }
+  const auto elements = root.AsVector();
+  auto storage = std::vector<PayloadWord>{};
+  for (size_t i = 0; i < elements.size(); i++) {
+    if (not elements[i].IsBlob()) {
+      return false;
+    }
+    const auto blob = elements[i].AsBlob();
+    if (not tablePayloadFits(
+            schema, tableDef,
+            alignPayload(std::span{blob.data(), blob.size()}, storage))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// `rest` is the path past `fieldDef`, a vector field of `tableDef`; `table` is
+// null where the buffer stores no such vector.
+static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
+                                        const reflection::Object* tableDef,
+                                        const reflection::Field* fieldDef,
+                                        const Table* table,
+                                        std::span<const uint8_t> payload,
+                                        std::span<const uint32_t> rest,
+                                        uoffset_t bytesBuilt) {
+  const auto* type = fieldDef->type();
+  const auto elementType = type->element();
+  const auto* elementDef = (elementType == reflection::Obj)
+                               ? schema->objects()->Get(type->index())
+                               : nullptr;
+  if (elementDef != nullptr and elementDef->is_struct()) {
+    // A struct element is inline, and nothing builds one.
+    return ApplyOutcome::Refused;
+  }
+  if (rest.empty()) {
+    if (elementType == reflection::Union) {
+      // The members' types live in a second vector no payload carries.
+      return ApplyOutcome::Refused;
+    }
+    if (elementDef != nullptr) {
+      return appliedIf(flexPayloadFits(payload, [&](auto root) {
+        return tableListFits(schema, elementDef, root);
+      }));
+    }
+    return appliedIf(flexPayloadFits(payload, [&](auto root) {
+      return payloadFits(schema, type, false, root);
+    }));
+  }
+  const auto index = rest.front();
+  const auto deeper = rest.subspan(1);
+  if (not vectorCanGrowTo(elementType, index, bytesBuilt)) {
+    return ApplyOutcome::Refused;
+  }
+  if (elementDef != nullptr) {
+    const auto* vector = getFieldVT(table, fieldDef);
+    const auto* element = (vector != nullptr and index < vector->size())
+                              ? vector->Get(index)
+                              : nullptr;
+    return classifyPut(schema, elementDef, element, payload, deeper,
+                       bytesBuilt);
+  }
+  if (elementType == reflection::Union) {
+    if (deeper.empty()) {
+      return ApplyOutcome::Refused;
+    }
+    const auto member = deeper.front();
+    const auto* memberDef =
+        getUnionTableDefFromEnumIndex(schema, fieldDef, member);
+    if (memberDef == nullptr) {
+      return ApplyOutcome::Refused;
+    }
+    const auto* vector = getFieldVT(table, fieldDef);
+    const auto* types =
+        getFieldVI<uint8_t>(table, getUnionTypeField(tableDef, fieldDef));
+    const auto holdsMember = vector != nullptr and types != nullptr
+                             and index < std::min(vector->size(), types->size())
+                             and types->Get(index) == member;
+    return classifyPut(schema, memberDef,
+                       holdsMember ? vector->Get(index) : nullptr, payload,
+                       deeper.subspan(1), bytesBuilt);
+  }
+  if (not deeper.empty()) {
+    return ApplyOutcome::Refused;
+  }
+  return appliedIf(flexPayloadFits(payload, [&](auto root) {
+    return payloadFits(schema, type, true, root);
+  }));
+}
+
+// What a put along `path` comes to in `table`, a table of `tableDef` or null
+// where the buffer stores none. A put creates what it reaches through, so it
+// is only ever Applied or Refused. A path that ends at a table carries a
+// flatbuffer payload, verified as that table; every other payload is a
+// flexbuffer, checked against the type it is written as.
+static ApplyOutcome classifyPut(const reflection::Schema* schema,
+                                const reflection::Object* tableDef,
+                                const Table* table,
+                                std::span<const uint8_t> payload,
+                                std::span<const uint32_t> path,
+                                uoffset_t bytesBuilt) {
+  if (path.empty()) {
+    return appliedIf(tablePayloadFits(schema, tableDef, payload));
+  }
+  const auto* fieldDef = fieldAtOffset(tableDef, path.front());
+  if (fieldDef == nullptr or isDiscriminator(fieldDef)) {
+    return ApplyOutcome::Refused;
+  }
+  const auto rest = path.subspan(1);
+  const auto* type = fieldDef->type();
+  switch (type->base_type()) {
+    case reflection::Obj: {
+      const auto* subDef = schema->objects()->Get(type->index());
+      if (subDef->is_struct()) {
+        return appliedIf(flexPayloadFits(payload, [&](auto root) {
+          auto image = std::vector<uint8_t>(subDef->bytesize());
+          return writeStructPayload(schema, subDef, image, rest, root);
+        }));
+      }
+      return classifyPut(schema, subDef, storedSubtable(table, fieldDef),
+                         payload, rest, bytesBuilt);
+    }
+    case reflection::Union: {
+      if (rest.empty()) {
+        return ApplyOutcome::Refused;
+      }
+      const auto member = rest.front();
+      const auto* memberDef =
+          getUnionTableDefFromEnumIndex(schema, fieldDef, member);
+      if (memberDef == nullptr) {
+        return ApplyOutcome::Refused;
+      }
+      const auto held =
+          storesField(table, fieldDef)
+          and storedUnionMember(tableDef, fieldDef, table) == member;
+      return classifyPut(schema, memberDef,
+                         held ? GetFieldT(*table, *fieldDef) : nullptr, payload,
+                         rest.subspan(1), bytesBuilt);
+    }
+    case reflection::Vector:
+      return classifyPutInVector(schema, tableDef, fieldDef,
+                                 storesField(table, fieldDef) ? table : nullptr,
+                                 payload, rest, bytesBuilt);
+    case reflection::Array:
+      return ApplyOutcome::Refused;
+    default:
+      return appliedIf(rest.empty()
+                       and flexPayloadFits(payload, [&](auto root) {
+                             return payloadFits(schema, type, false, root);
+                           }));
+  }
+}
+
+// The offsets a put or delete carries, or none for a hand-built one that
+// carries no vector.
+static std::span<const uint32_t> operationPath(
+    const Vector<uint32_t>* offsets) {
+  return (offsets != nullptr) ? std::span{offsets->data(), offsets->size()}
+                              : std::span<const uint32_t>{};
+}
+
+static std::span<const uint8_t> operationPayload(const Put* put) {
+  return (put->payload() != nullptr)
+             ? std::span{put->payload()->data(), put->payload()->size()}
+             : std::span<const uint8_t>{};
+}
+
+// ---------------------------------------------------------------------------
 // Patch
 //
 // A Patch navigates via `offsets` to a subobject and applies a list of nested
@@ -1376,90 +1522,136 @@ static std::vector<uint32_t> concatPath(std::span<const uint32_t> prefix,
 }
 
 // Applies each operation in `updates` (prefixing its offsets with `prefix`) to
-// the running table, returning the accumulated flatbuffer. The first operation
-// reads `sourceTable`; each subsequent one reads the previous result.
-static flatbuffers::DetachedBuffer applyOperationList(
+// the running table, leaving the accumulated flatbuffer in `result`. The first
+// operation reads `sourceTable`; each subsequent one reads the previous
+// result.
+//
+// Answers Refused as soon as one operation is Refused against the table it
+// would edit. An operation that is NotStored builds nothing and leaves the
+// running table as it was, and the rest are still checked, so that a later
+// Refused one is not reported as NotStored; the list then answers NotStored.
+// `result` is meaningful only for Applied, and is left empty where no
+// operation built anything.
+static ApplyOutcome applyOperationList(
     const reflection::Schema* schema, const Table* sourceTable,
     std::span<const uint32_t> prefix,
     const Vector<serialized::Operation>* updateTypes,
-    const Vector<flatbuffers::Offset<void>>* updates, bool useStringPooling) {
+    const Vector<flatbuffers::Offset<void>>* updates, bool useStringPooling,
+    flatbuffers::DetachedBuffer& result) {
   const auto* rootDef = schema->root_table();
 
-  // An empty (or null) update list is a no-op; return a standalone copy of the
-  // source so every caller — including a nested empty patch — always gets a
-  // valid buffer to thread onward.
+  // An empty (or null) update list names no edit. It answers a standalone
+  // copy of the source so every caller -- a nested empty patch included --
+  // has a buffer to thread onward.
   if (updates == nullptr or updates->size() == 0) {
     FlatBufferBuilder builder;
     builder.Finish(Offset<Table>(
         CopyTable(builder, *schema, *rootDef, *sourceTable, useStringPooling)
             .o));
-    return builder.Release();
+    result = builder.Release();
+    return ApplyOutcome::Applied;
+  }
+  if (updateTypes == nullptr or updateTypes->size() != updates->size()) {
+    return ApplyOutcome::Refused;
   }
 
-  auto current = flatbuffers::DetachedBuffer{};
+  auto outcome = ApplyOutcome::Applied;
   const Table* source = sourceTable;
-
+  // Takes `built` as the running table.
+  const auto advance = [&](flatbuffers::DetachedBuffer built) {
+    result = std::move(built);
+    source = flatbuffers::GetAnyRoot(result.data());
+  };
   for (uoffset_t i = 0; i < updates->size(); i++) {
+    const auto* operation = updates->Get(i);
+    if (operation == nullptr) {
+      return ApplyOutcome::Refused;
+    }
     switch (updateTypes->Get(i)) {
       case Operation::Patch: {
-        const auto* subpatch = static_cast<const Patch*>(updates->Get(i));
-        current = applyOperationList(
+        const auto* subpatch = static_cast<const Patch*>(operation);
+        auto nested = flatbuffers::DetachedBuffer{};
+        const auto nestedOutcome = applyOperationList(
             schema, source, concatPath(prefix, subpatch->offsets()),
-            subpatch->updates_type(), subpatch->updates(), useStringPooling);
+            subpatch->updates_type(), subpatch->updates(), useStringPooling,
+            nested);
+        if (nestedOutcome == ApplyOutcome::Refused) {
+          return ApplyOutcome::Refused;
+        }
+        if (nestedOutcome == ApplyOutcome::NotStored) {
+          outcome = ApplyOutcome::NotStored;
+        }
+        if (nested.size() != 0) {
+          advance(std::move(nested));
+        }
         break;
       }
       case Operation::Put: {
-        const auto* put = static_cast<const Put*>(updates->Get(i));
-        FlatBufferBuilder builder;
+        const auto* put = static_cast<const Put*>(operation);
         auto storage = std::vector<PayloadWord>{};
-        auto offset = applyRequestPut(
-            builder, schema, rootDef, source,
-            alignPayload(
-                std::span{put->payload()->data(), put->payload()->size()},
-                storage),
-            concatPath(prefix, put->offsets()), useStringPooling);
-        builder.Finish(Offset<Table>(offset));
-        current = builder.Release();
+        const auto payload = alignPayload(operationPayload(put), storage);
+        const auto path = concatPath(prefix, put->offsets());
+        if (classifyPut(schema, rootDef, source, payload, path, 0)
+            != ApplyOutcome::Applied) {
+          return ApplyOutcome::Refused;
+        }
+        FlatBufferBuilder builder;
+        builder.Finish(
+            Offset<Table>(applyRequestPut(builder, schema, rootDef, source,
+                                          payload, path, useStringPooling)));
+        advance(builder.Release());
         break;
       }
       case Operation::Delete: {
-        const auto* del = static_cast<const Delete*>(updates->Get(i));
+        const auto* del = static_cast<const Delete*>(operation);
+        const auto path = concatPath(prefix, del->offsets());
+        const auto deleteOutcome =
+            classifyDelete(schema, rootDef, source, path);
+        if (deleteOutcome == ApplyOutcome::Refused) {
+          return ApplyOutcome::Refused;
+        }
+        if (deleteOutcome == ApplyOutcome::NotStored) {
+          outcome = ApplyOutcome::NotStored;
+          break;
+        }
         FlatBufferBuilder builder;
-        auto offset = applyRequestDelete(builder, schema, rootDef, source,
-                                         concatPath(prefix, del->offsets()),
-                                         useStringPooling);
-        builder.Finish(Offset<Table>(offset));
-        current = builder.Release();
+        builder.Finish(Offset<Table>(applyRequestDelete(
+            builder, schema, rootDef, source, path, useStringPooling)));
+        advance(builder.Release());
         break;
       }
-      case Operation::NONE:
-        continue;  // skip; leave the running result untouched
+      default:
+        return ApplyOutcome::Refused;
     }
-    source = flatbuffers::GetAnyRoot(current.data());
   }
-  return current;
+  return outcome;
 }
 
-static uoffset_t applyRequestPatch(FlatBufferBuilder& fbb,
-                                   const reflection::Schema* schema,
-                                   const Table* sourceTable, const Patch* patch,
-                                   bool useStringPooling) {
+static fbrequest::ApplyResult applyRequestPatch(
+    FlatBufferBuilder& fbb, const reflection::Schema* schema,
+    const Table* sourceTable, const Patch* patch, bool useStringPooling) {
   const auto* rootDef = schema->root_table();
   const auto* updates = patch->updates();
   if (updates == nullptr or updates->size() == 0) {
     // A patch with no updates leaves the source unchanged.
-    return CopyTable(fbb, *schema, *rootDef, *sourceTable, useStringPooling).o;
+    return {CopyTable(fbb, *schema, *rootDef, *sourceTable, useStringPooling).o,
+            ApplyOutcome::Applied};
   }
 
-  auto result = applyOperationList(
+  auto result = flatbuffers::DetachedBuffer{};
+  const auto outcome = applyOperationList(
       schema, sourceTable,
       concatPath(std::span<const uint32_t>{}, patch->offsets()),
-      patch->updates_type(), updates, useStringPooling);
+      patch->updates_type(), updates, useStringPooling, result);
+  if (outcome != ApplyOutcome::Applied) {
+    return {0, outcome};
+  }
 
   // Fold the accumulated result into the caller's builder.
-  return CopyTable(fbb, *schema, *rootDef,
-                   *flatbuffers::GetAnyRoot(result.data()), useStringPooling)
-      .o;
+  return {CopyTable(fbb, *schema, *rootDef,
+                    *flatbuffers::GetAnyRoot(result.data()), useStringPooling)
+              .o,
+          ApplyOutcome::Applied};
 }
 
 // ---------------------------------------------------------------------------
@@ -1869,35 +2061,59 @@ static uoffset_t applyRequestDelete(FlatBufferBuilder& fbb,
   return fbb.EndTable(start);
 }
 
-flatbuffers::Offset<const flatbuffers::Table*> fbrequest::applyRequest(
+fbrequest::ApplyResult fbrequest::tryApplyRequest(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
     const Table* sourceTable, const Request* request, bool useStringPooling) {
   const auto* rootTableDef = schema->root_table();
   switch (request->operation_type()) {
     case Operation::Put: {
       const auto* put = request->operation_as_Put();
-      const auto* offsets = put->offsets();
+      if (put == nullptr) {
+        return {0, ApplyOutcome::Refused};
+      }
       auto storage = std::vector<PayloadWord>{};
-      return applyRequestPut(
-          fbb, schema, rootTableDef, sourceTable,
-          alignPayload(
-              std::span{put->payload()->data(), put->payload()->size()},
-              storage),
-          std::span{offsets->data(), offsets->size()}, useStringPooling);
+      const auto payload = alignPayload(operationPayload(put), storage);
+      const auto path = operationPath(put->offsets());
+      const auto outcome = classifyPut(schema, rootTableDef, sourceTable,
+                                       payload, path, fbb.GetSize());
+      if (outcome != ApplyOutcome::Applied) {
+        return {0, outcome};
+      }
+      return {applyRequestPut(fbb, schema, rootTableDef, sourceTable, payload,
+                              path, useStringPooling),
+              ApplyOutcome::Applied};
     }
     case Operation::Patch: {
       const auto* patch = request->operation_as_Patch();
+      if (patch == nullptr) {
+        return {0, ApplyOutcome::Refused};
+      }
       return applyRequestPatch(fbb, schema, sourceTable, patch,
                                useStringPooling);
     }
     case Operation::Delete: {
       const auto* del = request->operation_as_Delete();
-      const auto* offsets = del->offsets();
-      return applyRequestDelete(fbb, schema, rootTableDef, sourceTable,
-                                std::span{offsets->data(), offsets->size()},
-                                useStringPooling);
+      if (del == nullptr) {
+        return {0, ApplyOutcome::Refused};
+      }
+      const auto path = operationPath(del->offsets());
+      const auto outcome =
+          classifyDelete(schema, rootTableDef, sourceTable, path);
+      if (outcome != ApplyOutcome::Applied) {
+        return {0, outcome};
+      }
+      return {applyRequestDelete(fbb, schema, rootTableDef, sourceTable, path,
+                                 useStringPooling),
+              ApplyOutcome::Applied};
     }
+    default:
+      return {0, ApplyOutcome::Refused};
   }
-  assert(false);
-  return 0;
+}
+
+flatbuffers::Offset<const flatbuffers::Table*> fbrequest::applyRequest(
+    FlatBufferBuilder& fbb, const reflection::Schema* schema,
+    const Table* sourceTable, const Request* request, bool useStringPooling) {
+  return tryApplyRequest(fbb, schema, sourceTable, request, useStringPooling)
+      .root;
 }

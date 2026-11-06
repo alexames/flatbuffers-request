@@ -84,13 +84,19 @@ Intermediate objects along the path are created as needed, so
   `delete number_vector[1].<the member it holds>`,
 - a field *inside* a sub-object, union member, or vector element.
 
-Deleting an absent field, an element of an absent vector, or anything inside a
-table, union or struct the buffer does not store is a **no-op** (the buffer is
-returned unchanged; nothing is created on the way), and so is deleting a union
-member other than the one stored, or a field of one. A field inside a struct,
-or inside an element of a vector of structs, cannot be removed individually
-— a struct has no way to record that a member is absent, so such a delete
-is a no-op. A `put` of a struct member does apply; see [design.md](design.md).
+A delete names something the buffer stores, or it builds nothing: deleting an
+absent field, an element past the end of a vector, an element of an absent
+vector, anything inside a table or union the buffer does not store, a union
+member other than the one stored, or a field of one, answers **`NotStored`**
+(see [Applying a request](#applying-a-request)). A caller treating delete as
+idempotent keeps the buffer it had.
+
+A member of a struct, an element of an array in one, and a member of an
+element of a vector of structs cannot be removed individually: a struct has no
+way to record that a member is absent. The parser refuses such a delete
+(`delete scalars.i8`, `delete struct_vector[0].i8`,
+`delete nested.structs[1]`), whether or not the buffer stores the struct. A
+`put` of a struct member does apply; see [design.md](design.md).
 
 ## patch
 
@@ -103,15 +109,37 @@ its path each time.
 patch { put i8 99 ; put i16 88 }              # two puts on the root
 patch player { put level 3 ; delete title }   # edits scoped to `player`
 patch a { patch b { put x 1 } }               # nested patches
-patch player { }                              # empty patch: no-op
+patch player { }                              # empty patch: a copy
 ```
 
 An omitted path (`patch { ... }`) patches the current object directly. Each
 inner operation's path is relative to the patched object.
 
+A patch is all or nothing. Each operation is checked against the table the
+operations before it left. The patch answers `Refused` where any operation is
+`Refused`, and otherwise `NotStored` where any is `NotStored`; for either it
+builds nothing, so `patch { put i8 1 ; delete i16 }` on a buffer without
+`i16` writes no `i8` either. A caller that treats a delete of something absent
+as success keeps its source only for a lone `delete`: a patch answering
+`NotStored` made none of its edits. An empty patch names no edit, and is
+applied as a copy.
+
 The patched object must be a table or a struct that a `put` could reach: a
 whole vector, a vector or array of structs or an element of one, and a union
 with no member named are refused, even for a patch holding only deletes.
+
+## Applying a request
+
+`tryApplyRequest` answers what applying a request came to, and builds the new
+root into the caller's builder only where it is `Applied`:
+
+| Outcome | Meaning |
+|---------|---------|
+| `Applied` | Every operation made the edit it names. A put of the value a field already holds is applied. |
+| `NotStored` | A delete names something the buffer does not store. Nothing is built. |
+| `Refused` | An operation cannot make the edit it names, whatever the buffer stores. Nothing is built. The parser refuses each such request; a hand-built one can still carry one. |
+
+`applyRequest` answers the same with only a root, null where nothing was built.
 
 ## Examples
 

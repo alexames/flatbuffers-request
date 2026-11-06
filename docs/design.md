@@ -20,6 +20,19 @@
 Splitting parse from apply means a request can be serialized, logged, sent over
 a wire, or replayed — apply is a pure function of `(schema, source, request)`.
 
+## Reporting what was written
+
+Apply resolves a request's path against the schema and the source, and checks
+its payload against the type it is written as, before it builds anything into
+the caller's builder, and answers `Applied`, `NotStored` or `Refused`
+(`tryApplyRequest`). Only an `Applied` request builds into the caller's
+builder, so a request that would change nothing leaves it as it was, and the
+caller can tell a delete of something absent (`NotStored`, which an idempotent
+caller treats as success) from a request no buffer could serve (`Refused`).
+The split follows what each half can know: the parser refuses what the schema
+alone decides -- a struct's members, an array's length -- and the apply
+decides what depends on the buffer.
+
 ## Why offset paths, not field names
 
 The parsed `Request` records numeric vtable offsets rather than field names, so
@@ -39,22 +52,21 @@ payload into that image, and pushes it inline.
   (`put scalars {...}`, a map naming any subset of members, the rest keeping
   what they had), and a struct the buffer does not store yet (the unnamed
   members start from zero).
-- **`delete` of a struct member remains a no-op**: a struct has no way to
-  record that a member is absent, so there is nothing for a delete to do.
+- **`delete` of a struct member is refused**: a struct has no way to record
+  that a member is absent, so there is nothing for a delete to do.
 - **Fixed-size arrays of scalars** inside a struct take a put by element
   (`put scalars.i32_array[3] 9`) or whole (`put scalars.i32_array [7, 8]`,
   leaving the elements the payload does not reach). An array cannot grow or
-  shrink, so a payload longer than `N` writes nothing at all.
-- **A write that writes nothing leaves the field as it was**, including
-  leaving an absent struct absent rather than creating one of zeroes. A map
-  naming no member the struct declares -- an empty one included -- writes
-  nothing, and so does an empty array payload. A map naming one known key
-  among unknown ones writes that one.
-- **A member whose payload the struct cannot take REFUSES the map it is in**,
-  rather than being skipped: a too-long array, a non-map for a nested struct,
-  or a value of the wrong kind for a scalar member. The distinction is between
-  a payload that asked for nothing, which is skipped, and one that asked for
-  something impossible, which is refused along with its siblings.
+  shrink, so a payload longer than `N` is refused.
+- **A struct put writes what its payload names, or is refused.** A map
+  naming no member (`put scalars {}`), or naming any member the struct does
+  not declare (`put scalars {"i8": 1, "zzz": 2}`), an empty array, an array
+  longer than its length, and any of these as the value of a member a map
+  names (`put nested {"inner": {}, "tail": 77}`), are refused rather than
+  written in part or not at all. So is a member whose value is of the wrong
+  kind: a non-map for a nested struct, a non-array for an array, a string,
+  map or array for a scalar. The parser decides all of this from the schema
+  alone; the apply refuses a hand-built request carrying one.
 
 A `put` is REFUSED, rather than served wrongly, for:
 
