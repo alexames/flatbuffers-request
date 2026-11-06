@@ -55,12 +55,14 @@ class RequestTestBase : public ::testing::TestWithParam<TestArgs> {
   flatbuffers::DetachedBuffer applyRequestStr(const char* requestStr) {
     auto& builder = parser_.builder_;
     auto request = parseFlatbufferRequest(schema_, requestStr);
-    EXPECT_TRUE(request.has_value())
-        << "Failed to parse request: " << requestStr;
+    if (not request.has_value()) {
+      ADD_FAILURE() << "Failed to parse request: " << requestStr;
+      copyTable(builder, schema_, emptyBuffer_.data(), false);
+      return builder.Release();
+    }
 
     builder.Finish(applyRequest(
         builder, schema_, flatbuffers::GetAnyRoot(emptyBuffer_.data()),
-        // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
         flatbuffers::GetRoot<serialized::Request>(request->data())));
 
     auto verifier =
@@ -304,7 +306,29 @@ INSTANTIATE_TEST_SUITE_P(
         TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[3].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "FloatingPoint"],                                  "number_vector": [{"value":1},{"value":2},{"value":3},{"value":9}]})"),
         TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[4].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer", "FloatingPoint"],                       "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4},{"value":9}]})"),
         TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[5].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer", "Integer", "FloatingPoint"],            "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4},{},{"value":9}]})"),
-        TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[6].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer", "Integer", "Integer", "FloatingPoint"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4},{},{},{"value":9}]})")
+        TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[6].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer", "Integer", "Integer", "FloatingPoint"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4},{},{},{"value":9}]})"),
+
+        // An element of a vector the buffer does not store creates the
+        // vector, padded the way a stored vector grows past its end: empty
+        // strings, empty tables, and the first member for a union.
+        TestArgs(R"({"i32": 1})", R"(put string_vector[0] "z")",            R"({"i32": 1, "string_vector": ["z"]})"),
+        TestArgs(R"({"i32": 1})", R"(put string_vector[2] "z")",            R"({"i32": 1, "string_vector": ["", "", "z"]})"),
+        TestArgs(R"({"i32": 1})", R"(put object_vector[0] {"i8":9})",       R"({"i32": 1, "object_vector": [{"i8":9}]})"),
+        TestArgs(R"({"i32": 1})", R"(put object_vector[1].i8 9)",           R"({"i32": 1, "object_vector": [{}, {"i8":9}]})"),
+        TestArgs(R"({"i32": 1})", R"(put number_vector[0].Integer {"value":9})", R"({"i32": 1, "number_vector_type": ["Integer"], "number_vector": [{"value":9}]})"),
+        TestArgs(R"({"i32": 1})", R"(put number_vector[1].FloatingPoint.value 9)", R"({"i32": 1, "number_vector_type": ["Integer", "FloatingPoint"], "number_vector": [{}, {"value":9.0}]})"),
+
+        // The same, inside a table the buffer does not store either.
+        TestArgs(R"({"i32": 1})", R"(put object.i32_vector[1] 9)",          R"({"i32": 1, "object": {"i32_vector": [0, 9]}})"),
+        TestArgs(R"({"i32": 1})", R"(put object.color_vector[0] 4)",        R"({"i32": 1, "object": {"color_vector": ["Green"]}})"),
+        TestArgs(R"({"i32": 1})", R"(put object.string_vector[1] "z")",     R"({"i32": 1, "object": {"string_vector": ["", "z"]}})"),
+        TestArgs(R"({"i32": 1})", R"(put object.object_vector[0].i8 9)",    R"({"i32": 1, "object": {"object_vector": [{"i8":9}]}})"),
+        TestArgs(R"({"i32": 1})", R"(put object.number_vector[0].Integer.value 9)", R"({"i32": 1, "object": {"number_vector_type": ["Integer"], "number_vector": [{"value":9}]}})"),
+        TestArgs(R"({"i32": 1})", R"(put object.object.object_vector[1] {"i8":9})", R"({"i32": 1, "object": {"object": {"object_vector": [{}, {"i8":9}]}}})"),
+
+        // Switching an element's member carries nothing across, as for a
+        // single union.
+        TestArgs(R"({"number_vector_type": ["Integer"], "number_vector": [{"value":1}]})", R"(put number_vector[0].Fraction.denominator 5)", R"({"number_vector_type": ["Fraction"], "number_vector": [{"denominator":5}]})")
         ));
 // clang-format on
 
@@ -379,8 +403,21 @@ INSTANTIATE_TEST_SUITE_P(
         TestArgs(R"({"i32": 1})", "delete string_vector[0]",       R"({"i32": 1})"),
         TestArgs(R"({"i32": 1})", "delete object_vector[0]",       R"({"i32": 1})"),
         TestArgs(R"({"i32": 1})", "delete number_vector[0].Integer", R"({"i32": 1})"),
-        // (Struct field / struct-vector deletes are exercised in StructDeleteTest
-        // below -- the TestingMatchers comparator can't compare struct fields.)
+        // Reaching into a table, union or struct the buffer does not store
+        // removes nothing and builds nothing.
+        TestArgs(R"({"i32": 1})", "delete object.i8",                        R"({"i32": 1})"),
+        TestArgs(R"({"i32": 1})", "delete object.i32_vector[0]",             R"({"i32": 1})"),
+        TestArgs(R"({"i32": 1})", "delete object.object_vector[0].i8",       R"({"i32": 1})"),
+        TestArgs(R"({"i32": 1})", "delete number.Integer.value",             R"({"i32": 1})"),
+        TestArgs(R"({"i32": 1})", "delete object.number.Integer.value",      R"({"i32": 1})"),
+        TestArgs(R"({"i32": 1})", "delete scalars.i8",                       R"({"i32": 1})"),
+        TestArgs(R"({"i32": 1})", "delete object.scalars.i8",                R"({"i32": 1})"),
+        // A field of a member the union does not hold is not there to delete.
+        TestArgs(R"({"number_type": "Integer", "number": {"value": 5}})", "delete number.Fraction.numerator", R"({"number_type": "Integer", "number": {"value": 5}})"),
+        TestArgs(R"({"number_vector_type": ["Integer"], "number_vector": [{"value":5}]})", "delete number_vector[0].Fraction.numerator", R"({"number_vector_type": ["Integer"], "number_vector": [{"value":5}]})"),
+        // (The comparator compares a struct's presence but not its contents,
+        // so struct field / struct-vector deletes are exercised in
+        // StructDeleteTest below.)
         // Delete a whole union-vector element (drops both parallel vectors).
         TestArgs(R"({"number_vector_type": ["Integer","Integer","Integer"], "number_vector": [{"value":1},{"value":2},{"value":3}]})", "delete number_vector[1].Integer", R"({"number_vector_type": ["Integer","Integer"], "number_vector": [{"value":1},{"value":3}]})"),
         // Recurse into a union-vector element and delete a field inside it.
@@ -482,10 +519,15 @@ class BufferRequestTest : public ::testing::Test {
       const std::vector<uint8_t>& initial, std::string_view request) {
     flatbuffers::FlatBufferBuilder fbb;
     auto parsed = parseFlatbufferRequest(schema_, request);
-    EXPECT_TRUE(parsed.has_value()) << request;
+    if (not parsed.has_value()) {
+      // The caller reads fields off the answer, so it gets the initial
+      // buffer back unchanged rather than nothing to read.
+      ADD_FAILURE() << "Failed to parse request: " << request;
+      copyTable(fbb, schema_, initial.data(), false);
+      return fbb.Release();
+    }
     fbb.Finish(applyRequest(
         fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
-        // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
         flatbuffers::GetRoot<serialized::Request>(parsed->data())));
     auto result = fbb.Release();
     auto verifier = flatbuffers::Verifier(result.data(), result.size());
@@ -719,12 +761,151 @@ TEST_F(RefusedPutTest, StillDeletesAnElementOfAVectorOfStructs) {
       parseFlatbufferRequest(schema_, "delete struct_vector[0]").has_value());
 }
 
+TEST_F(RefusedPutTest, RefusesAUnionMemberThatHoldsNoTable) {
+  // NONE is a member of every union, and names no object for the path to
+  // continue into or the payload to be parsed against.
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, "put number.NONE {}").has_value());
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, "put number.NONE.value 1").has_value());
+  EXPECT_FALSE(parseFlatbufferRequest(schema_, "put number_vector[0].NONE {}")
+                   .has_value());
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, "delete number.NONE").has_value());
+  EXPECT_FALSE(
+      parseFlatbufferRequest(schema_, "patch number.NONE { put value 1 }")
+          .has_value());
+  EXPECT_TRUE(
+      parseFlatbufferRequest(schema_, "delete number.Integer").has_value());
+}
+
 TEST_F(RefusedPutTest, RefusesAWholeVectorOfUnions) {
   // A union vector pairs with a vector of discriminators that a JSON array
   // cannot carry, and its type index names the ENUM rather than an object.
   EXPECT_FALSE(
       parseFlatbufferRequest(schema_, R"(put number_vector [{"value": 1}])")
           .has_value());
+}
+
+// The parser refuses a union member that holds no table, but a request is a
+// buffer that can come from anywhere, and the verifier accepts a stored union
+// whose discriminant is NONE or one the schema does not declare. Neither has
+// a table to read the member as.
+class HandBuiltTest : public BufferRequestTest {
+ protected:
+  flatbuffers::DetachedBuffer applyPut(const std::vector<uint8_t>& initial,
+                                       const std::vector<uint16_t>& path) {
+    flatbuffers::FlatBufferBuilder requestBuilder;
+    const auto payload = std::vector<uint8_t>{};
+    requestBuilder.Finish(serialized::CreateRequest(
+        requestBuilder, serialized::Operation::Put,
+        serialized::CreatePut(requestBuilder, requestBuilder.CreateVector(path),
+                              requestBuilder.CreateVector(payload))
+            .Union()));
+    return apply(initial, requestBuilder.GetBufferPointer());
+  }
+
+  flatbuffers::DetachedBuffer applyText(const std::vector<uint8_t>& initial,
+                                        std::string_view request) {
+    auto parsed = parseFlatbufferRequest(schema_, request);
+    if (not parsed.has_value()) {
+      ADD_FAILURE() << "Failed to parse request: " << request;
+      flatbuffers::FlatBufferBuilder fbb;
+      copyTable(fbb, schema_, initial.data(), false);
+      return fbb.Release();
+    }
+    return apply(initial, parsed->data());
+  }
+
+  // A buffer storing `string`, `object` and `i32`, and a `number` whose
+  // discriminant is `member` and whose value is an Integer of 3.
+  static std::vector<uint8_t> withUnion(uint8_t member) {
+    flatbuffers::FlatBufferBuilder fbb;
+    const auto string = fbb.CreateString("kept");
+    auto objectBuilder = matcher_test::TestSchemaBuilder{fbb};
+    objectBuilder.add_i8(3);
+    const auto object = objectBuilder.Finish();
+    const auto integer = matcher_test::CreateInteger(fbb, 3);
+    auto builder = matcher_test::TestSchemaBuilder{fbb};
+    builder.add_string(string);
+    builder.add_object(object);
+    builder.add_i32(7);
+    builder.add_number_type(static_cast<matcher_test::Number>(member));
+    builder.add_number(integer.Union());
+    fbb.Finish(builder.Finish());
+    return {fbb.GetBufferPointer(), fbb.GetBufferPointer() + fbb.GetSize()};
+  }
+
+  uint16_t fieldOffset(const char* name) {
+    return schema_->root_table()->fields()->LookupByKey(name)->offset();
+  }
+
+  static void expectSiblingsKept(const matcher_test::TestSchema* ts) {
+    ASSERT_NE(ts->string(), nullptr);
+    EXPECT_EQ(ts->string()->string_view(), "kept");
+    ASSERT_NE(ts->object(), nullptr);
+    EXPECT_EQ(ts->object()->i8(), 3);
+    EXPECT_EQ(ts->i32(), 7);
+  }
+
+ private:
+  flatbuffers::DetachedBuffer apply(const std::vector<uint8_t>& initial,
+                                    const uint8_t* request) {
+    flatbuffers::FlatBufferBuilder fbb;
+    fbb.Finish(
+        applyRequest(fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
+                     flatbuffers::GetRoot<serialized::Request>(request)));
+    auto result = fbb.Release();
+    auto verifier = flatbuffers::Verifier(result.data(), result.size());
+    EXPECT_TRUE(matcher_test::VerifyTestSchemaBuffer(verifier));
+    return result;
+  }
+};
+
+constexpr auto kNone = uint8_t{0};
+constexpr auto kUndeclared = uint8_t{99};
+constexpr auto kInteger = static_cast<uint8_t>(matcher_test::Number::Integer);
+
+TEST_F(HandBuiltTest, WritesNoUnionMemberForNone) {
+  const auto initial =
+      GetBuffer(R"({"string": "kept", "object": {"i8": 3}, "i32": 7})");
+  for (const auto& path :
+       {std::vector<uint16_t>{fieldOffset("number"), kNone},
+        std::vector<uint16_t>{fieldOffset("number"), kUndeclared},
+        std::vector<uint16_t>{fieldOffset("number"), kNone, 4}}) {
+    auto result = applyPut(initial, path);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    EXPECT_EQ(ts->number_type(), matcher_test::Number::NONE);
+    EXPECT_EQ(ts->number(), nullptr);
+    expectSiblingsKept(ts);
+  }
+}
+
+TEST_F(HandBuiltTest, KeepsAStoredUnionAPutNamingNoTableCannotWrite) {
+  const auto initial = withUnion(kInteger);
+  for (const auto& path :
+       {std::vector<uint16_t>{fieldOffset("number"), kNone},
+        std::vector<uint16_t>{fieldOffset("number"), kUndeclared, 4}}) {
+    auto result = applyPut(initial, path);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_EQ(ts->number_type(), matcher_test::Number::Integer);
+    ASSERT_NE(ts->number_as_Integer(), nullptr);
+    EXPECT_EQ(ts->number_as_Integer()->value(), 3);
+    expectSiblingsKept(ts);
+  }
+}
+
+TEST_F(HandBuiltTest, CopiesAStoredUnionWithNoTableToReadItAs) {
+  for (const auto member : {kNone, kUndeclared}) {
+    const auto initial = withUnion(member);
+    for (const auto* request : {"put i8 5", "delete i8"}) {
+      auto result = applyText(initial, request);
+      const auto* ts = matcher_test::GetTestSchema(result.data());
+      EXPECT_EQ(static_cast<uint8_t>(ts->number_type()), member) << request;
+      EXPECT_NE(ts->number(), nullptr) << request;
+      expectSiblingsKept(ts);
+    }
+  }
 }
 
 // A struct member that is itself a struct, and an array whose elements are
@@ -740,16 +921,17 @@ class PayloadAlignmentTest : public BufferRequestTest {
   /// @return The verified result of the apply.
   flatbuffers::DetachedBuffer applyShifted(const char* request, size_t shift) {
     auto parsed = parseFlatbufferRequest(schema_, request);
-    EXPECT_TRUE(parsed.has_value()) << request;
+    const auto initial = GetBuffer("{}");
+    flatbuffers::FlatBufferBuilder fbb;
     if (not parsed.has_value()) {
-      return {};
+      ADD_FAILURE() << "Failed to parse request: " << request;
+      copyTable(fbb, schema_, initial.data(), false);
+      return fbb.Release();
     }
     auto words = std::vector<uint64_t>((parsed->size() + shift + 7) / 8);
     auto* shifted = reinterpret_cast<uint8_t*>(words.data()) + shift;
     std::memcpy(shifted, parsed->data(), parsed->size());
 
-    const auto initial = GetBuffer("{}");
-    flatbuffers::FlatBufferBuilder fbb;
     fbb.Finish(
         applyRequest(fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
                      flatbuffers::GetRoot<serialized::Request>(shifted)));

@@ -63,8 +63,14 @@ bool parseFlatbufferOffsetPath_ParseUnionName(
   if (unionValue == unionEnum->values()->end()) {
     return false;
   }
+  // NONE is a member of every union and holds no table: there is no object
+  // for the path to continue into or for a payload to be parsed against.
+  const auto* memberType = unionValue->union_type();
+  if (memberType == nullptr or memberType->base_type() != reflection::Obj) {
+    return false;
+  }
   outOffsets->push_back(unionValue->value());
-  *outObject = schema->objects()->Get(unionValue->union_type()->index());
+  *outObject = schema->objects()->Get(memberType->index());
   return true;
 }
 

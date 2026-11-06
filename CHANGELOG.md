@@ -20,6 +20,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `put i32 12` wrote 12, one cut short of a closing brace was accepted, and a
   view at the end of an allocation read beyond it. The request is now copied
   into a terminated string before it is parsed.
+- A `put` of a vector element faulted wherever the buffer did not store the
+  vector's table: `put object.i32_vector[0] 5` with no `object` read the
+  vector out of a null table, for every element type. A `put` of an element
+  of a vector of strings, tables or unions faulted wherever the buffer did not
+  store the vector, even in a stored table (`put string_vector[0] "z"`). Each
+  now creates the vector, padded as a stored vector grows past its end:
+  zeroes, empty strings, empty tables, and the union's first member.
+- A path naming a union's `NONE` member (`put number.NONE {}`,
+  `delete number.NONE`) read the schema's object list at index -1. NONE holds
+  no table, so the parser now refuses it. Apply looks a union member up by its
+  discriminant rather than its position, so a hand-built request naming NONE
+  or an undeclared member writes nothing and leaves the union as stored.
+- Copying a stored union whose discriminant is NONE, or one the schema does
+  not declare, faulted on every request that copied it; the verifier accepts
+  both. Such a value is now kept as an empty table under the same
+  discriminant.
+- A `put` whose terminal field could not be built shifted every later field's
+  offset by one: the table builder read an offset for it that the generate
+  pass had not pushed, handing each later field its neighbour's and reading
+  past the end of the list. Such a field now keeps what the buffer stores, or
+  stays absent, and a union's discriminant stays with its value.
+- An edit inside a union-vector element, or a delete inside a union, read the
+  stored member as the member the path names when the two differed, reading
+  its fields at the other member's offsets: a put of a Fraction's
+  `denominator` over a stored `Integer` carried the Integer's value into the
+  Fraction's numerator. The stored member is now a source only when it is the
+  member named, and a delete of another member's field leaves the union as it
+  was.
+- A `delete` reaching into a table, union or struct the buffer did not store
+  built one: `delete object.i8` with no `object` left an empty `object`, and
+  `delete number.Integer.value` with no `number` left an `Integer` tagged
+  NONE. Inside a table that was itself absent the union case faulted, and
+  `delete scalars.i8` with no `scalars` copied a struct out of bytes that were
+  not there. Such a delete now leaves the field absent.
+- A whole-vector `put` of a vector of unions read the union's enum index as an
+  object index. No payload carries the members' types, so nothing is built
+  for one; the parser already refused it.
 
 ## [0.4.1] - 2026-09-20
 
