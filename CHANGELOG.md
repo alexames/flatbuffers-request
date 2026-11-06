@@ -126,7 +126,8 @@ Breaking changes, each described below:
   dropped; and one that would copy a field the schema does not declare,
   which was dropped. A request that removes such a union, union element or
   whole vector of unions, or switches the union to another member, does not
-  copy it and is still applied. A put whose value holds one at any depth is refused too.
+  copy it and is still applied. A put whose value holds one at any depth is
+  refused too.
 - A hand-built request naming a union member that holds no table (`NONE` or
   a value the union does not declare), or a member value past a
   discriminant's 255, is `Refused`. A put of such a member wrote an empty
