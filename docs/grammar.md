@@ -24,9 +24,31 @@ array are refused. Nothing may follow the operation but whitespace.
 `value` is parsed as JSON against the field's type:
 tables, union members and vectors of tables go through the FlatBuffers JSON
 parser, and everything else -- scalars, enums, strings, structs, and vectors
-and arrays of scalars -- through a flexbuffer. A payload of the wrong kind is
-refused rather than coerced, so an enum takes its ORDINAL and not its name: a
-name would read as 0.
+and arrays of scalars -- as a flexbuffer, read by the library itself. A value
+of the wrong kind is refused rather than coerced, so an enum takes its
+ORDINAL and not its name: a name would read as 0.
+
+## Values
+
+A value is checked against the scalar, string, struct, vector or array it is
+written as, wherever that is: a field, a vector element, a struct member, an
+element of an array in a struct, a member named in a struct's map, or an
+element of a whole vector or array. Anything else is refused.
+
+| Target | Takes |
+|--------|-------|
+| bool | `true`, `false`, `0` or `1`. |
+| integer, enum | A whole numeral, decimal or `0x` hex, with an optional sign, within the target's width: `put i8 300`, `put ui8 -1` and `put color 256` are refused, not wrapped. A uint64 takes all of `0` to `18446744073709551615`. A fraction, an exponent (`1e2`), a bool or a non-finite value is not an integer. |
+| float32 | Any number that does not round to infinity as a float32 (`1e39` is refused; `3.4028235e38` is the largest float32): an integer, past the 64-bit ranges too, a decimal or exponent numeral, and `inf`, `infinity` or `nan` with an optional sign. |
+| float64 | Any number a double holds, as for a float32. A numeral too large for a double (`1e309`) is refused; one too small for its type (`1e-400`) is written as the nearest value it holds, 0 or a subnormal. Hex floats (`0x1p3`) are not read. |
+| string | A string quoted with `"` or `'`, holding no control character and valid UTF-8, with the escapes `\"`, `\'`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX` (a surrogate pair as two) and `\xXX` (a byte). |
+| vector | A list of values its element takes, possibly empty, with an optional trailing comma. |
+| array, struct | As [design.md](design.md) describes: a non-empty list no longer than the array, or a map naming only members the struct declares. |
+
+A map's keys are quoted or bare names, and may not repeat. `null` is no
+value, and comments are not read. A numeral may not run on into other text
+(`put i32 5abc`, `put f32 1.5f`), and nothing may follow a value but
+whitespace, or the `;` or `}` of a patch.
 
 ## Paths
 
@@ -84,13 +106,19 @@ Intermediate objects along the path are created as needed, so
   `delete number_vector[1].<the member it holds>`,
 - a field *inside* a sub-object, union member, or vector element.
 
-Deleting an absent field, an element of an absent vector, or anything inside a
-table, union or struct the buffer does not store is a **no-op** (the buffer is
-returned unchanged; nothing is created on the way), and so is deleting a union
-member other than the one stored, or a field of one. A field inside a struct,
-or inside an element of a vector of structs, cannot be removed individually
-— a struct has no way to record that a member is absent, so such a delete
-is a no-op. A `put` of a struct member does apply; see [design.md](design.md).
+A delete names something the buffer stores, or it builds nothing: deleting an
+absent field, an element past the end of a vector, an element of an absent
+vector, anything inside a table or union the buffer does not store, a union
+member other than the one stored, or a field of one, answers **`NotStored`**
+(see [Applying a request](#applying-a-request)). A caller treating delete as
+idempotent keeps the buffer it had.
+
+A member of a struct, an element of an array in one, and a member of an
+element of a vector of structs cannot be removed individually: a struct has no
+way to record that a member is absent. The parser refuses such a delete
+(`delete scalars.i8`, `delete struct_vector[0].i8`,
+`delete nested.structs[1]`), whether or not the buffer stores the struct. A
+`put` of a struct member does apply; see [design.md](design.md).
 
 ## patch
 
@@ -103,15 +131,37 @@ its path each time.
 patch { put i8 99 ; put i16 88 }              # two puts on the root
 patch player { put level 3 ; delete title }   # edits scoped to `player`
 patch a { patch b { put x 1 } }               # nested patches
-patch player { }                              # empty patch: no-op
+patch player { }                              # empty patch: a copy
 ```
 
 An omitted path (`patch { ... }`) patches the current object directly. Each
 inner operation's path is relative to the patched object.
 
+A patch is all or nothing. Each operation is checked against the table the
+operations before it left. The patch answers `Refused` where any operation is
+`Refused`, and otherwise `NotStored` where any is `NotStored`; for either it
+builds nothing, so `patch { put i8 1 ; delete i16 }` on a buffer without
+`i16` writes no `i8` either. A caller that treats a delete of something absent
+as success keeps its source only for a lone `delete`: a patch answering
+`NotStored` made none of its edits. An empty patch names no edit, and is
+applied as a copy.
+
 The patched object must be a table or a struct that a `put` could reach: a
 whole vector, a vector or array of structs or an element of one, and a union
 with no member named are refused, even for a patch holding only deletes.
+
+## Applying a request
+
+`tryApplyRequest` answers what applying a request came to, and builds the new
+root into the caller's builder only where it is `Applied`:
+
+| Outcome | Meaning |
+|---------|---------|
+| `Applied` | Every operation made the edit it names. A put of the value a field already holds is applied. |
+| `NotStored` | A delete names something the buffer does not store. Nothing is built. |
+| `Refused` | An operation cannot make the edit it names, whatever the buffer stores. Nothing is built. The parser refuses each such request; a hand-built one can still carry one. |
+
+`applyRequest` answers the same with only a root, null where nothing was built.
 
 ## Examples
 

@@ -6,7 +6,67 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `tryApplyRequest`, which answers what applying a request came to as an
+  `ApplyOutcome` beside the new root: `Applied`, `NotStored` (a delete names
+  something the buffer does not store) or `Refused` (no buffer could serve the
+  request). Nothing is built into the caller's builder for an outcome other
+  than `Applied`. A patch is all or nothing: it answers `Refused` where any of
+  its operations is refused, otherwise `NotStored` where any is.
+
 ### Changed
+- `applyRequest` returns a null offset, and builds nothing, for a request that
+  does not make the edit it names. It returned a rebuilt copy of the source,
+  indistinguishable from a request that was applied. A caller passing its
+  result straight to `Finish` must now check it first. Both functions are
+  `[[nodiscard]]`. A caller that treats a
+  delete of something absent as success uses `tryApplyRequest` and keeps its
+  source on `NotStored`. The `fbrequest` tool exits with status 1 for such a
+  request.
+- A `delete` of something the buffer does not store is `NotStored` rather than
+  a reported success: a field it does not store, an element past the end of a
+  vector, an element of a vector it does not store, anything inside a table or
+  union it does not store, and a union member other than the one it holds, or
+  a field of one.
+- The parser refuses a `delete` naming a member of a struct, an element of an
+  array in one, or a member of an element of a vector of structs
+  (`delete scalars.i8`, `delete struct_vector[0].i8`,
+  `delete nested.structs[1]`). A struct cannot lose a member, so each was a
+  no-op reported applied.
+- The parser refuses a struct `put` whose value writes nothing or drops part of
+  itself: a map naming no member (`put scalars {}`), a map naming any member
+  the struct does not declare, which was silently dropped
+  (`put scalars {"i8": 1, "zzz": 2}`), an empty array or one longer than its
+  declared length, and any of these as the value of a member a map names
+  (`put nested {"inner": {}, "tail": 77}`), which wrote the members beside it.
+  A hand-built request carrying one is `Refused`.
+- A value for a scalar, a string, a struct, or a vector or array of scalars is
+  read by the library's own JSON value reader, and checked against what it
+  is written as (see `docs/grammar.md`). Values that were accepted and are now
+  refused: `null`, which wrote 0; a bool for an integer (`put i32 true` wrote
+  1); a fraction or exponent for an integer (`put i32 1.5` wrote 1); an
+  integer out of its field's range; a hex float (`0x1p3`); a comment; and a
+  string holding a control character or text that is not UTF-8.
+
+### Fixed
+- A value of the wrong kind for a scalar was written: `put i8 [5]` wrote the
+  list's length, and a list or map given as a vector element or a struct
+  member did the same. Each is refused, wherever the scalar is.
+- An integer out of range for its field wrapped (`put i8 300` wrote 44,
+  `put ui8 -1` wrote 255), a numeral past the signed 64-bit range was written
+  as 0, and a finite float past a float32's range was written as infinity.
+  Each is refused. A bool takes `true`, `false`, 0 or 1, and no other number;
+  an integer takes no fraction or exponent.
+- A uint64 above 2^63 - 1 was written as 0 when put as a field, a struct
+  member, an element of a vector or an array, or in a whole vector
+  (`put ui64_vector [18446744073709551615]`). The whole range, 0 to
+  2^64 - 1, is written, and a numeral past it is refused.
+- A hand-built `put` whose payload was not what its field holds read it
+  unchecked: a table payload that was empty, a flexbuffer or truncated read
+  out of bounds, and so did a flexbuffer payload that did not verify. The
+  apply now verifies a table payload against its table and a flexbuffer
+  payload as a flexbuffer, and checks its kind, and a request carrying no
+  operation, or no operations for a patch's types, is `Refused`.
 - The serialized `Request`'s offset paths (`Put.offsets`, `Patch.offsets`,
   `Delete.offsets`) are `[uint32]` rather than `[uint16]`, so that any element
   index a vector can hold is carried whole. A request serialized by an earlier
@@ -24,8 +84,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A hand-built `put` of a union-vector element naming a member that holds no
   table (`NONE`, or an undeclared value) leaves the vector as stored, as it
   does for a single union. It wrote an empty element.
-
-### Fixed
 - A `put` read the flatbuffer or flexbuffer its payload carries in place,
   even where it did not start on an 8-byte boundary: the request's payload
   vector guarantees 4, and each table of a vector-of-tables payload, stored as

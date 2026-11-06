@@ -177,9 +177,23 @@ int main(int argc, char** argv) {
   }
 
   flatbuffers::FlatBufferBuilder fbb;
-  fbb.Finish(fbrequest::applyRequest(
+  const auto applied = fbrequest::tryApplyRequest(
       fbb, schema, flatbuffers::GetAnyRoot(input->data()),
-      flatbuffers::GetRoot<serialized::Request>(parsed->data())));
+      flatbuffers::GetRoot<serialized::Request>(parsed->data()));
+  switch (applied.outcome) {
+    case fbrequest::ApplyOutcome::Applied:
+      break;
+    case fbrequest::ApplyOutcome::NotStored:
+      std::cerr << "fbrequest: the input does not store what the request "
+                   "deletes: "
+                << request << '\n';
+      return kRuntimeError;
+    case fbrequest::ApplyOutcome::Refused:
+      std::cerr << "fbrequest: the request cannot be applied: " << request
+                << '\n';
+      return kRuntimeError;
+  }
+  fbb.Finish(applied.root);
   const Bytes result(fbb.GetBufferPointer(),
                      fbb.GetBufferPointer() + fbb.GetSize());
 
