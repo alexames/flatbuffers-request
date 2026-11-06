@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A `put` read the flatbuffer or flexbuffer its payload carries in place,
+  even where it did not start on an 8-byte boundary: the request's payload
+  vector guarantees 4, and each table of a vector-of-tables payload, stored as
+  a flexbuffer blob, as little as 1. That is undefined behaviour (UBSan reports
+  it for `put object_vector [{"i8": 9}]`) and faults on targets that trap on
+  misaligned loads. Such a payload is now copied to aligned storage first.
+- `parseFlatbufferRequest` read past the end of the `std::string_view` it was
+  given. The FlatBuffers JSON and flexbuffer parsers it hands the payload to
+  read to a NUL terminator, which a view need not have, so the bytes after the
+  view were parsed as part of the request: a view of `put i32 1` cut from
+  `put i32 12` wrote 12, one cut short of a closing brace was accepted, and a
+  view at the end of an allocation read beyond it. The request is now copied
+  into a terminated string before it is parsed.
+
 ## [0.4.1] - 2026-09-20
 
 ### Fixed

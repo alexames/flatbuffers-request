@@ -21,7 +21,7 @@ jobs:
           - { name: Windows MSVC, os: windows-latest }
           - { name: macOS Clang,  os: macos-latest }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: lukka/get-cmake@latest
       - name: Set up MSVC
         if: runner.os == 'Windows'
@@ -47,11 +47,20 @@ jobs:
     name: clang-format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # Pinned so the check does not move with the runner image. CONTRIBUTING
+      # says how to run the same version locally.
+      - name: Install clang-format
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/clang-format"
+          "$RUNNER_TEMP/clang-format/bin/pip" install --quiet clang-format==19.1.5
+          echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
       - name: Check formatting
         shell: bash
         run: |
-          find include src test fuzz \
+          clang-format --version
+          find include src test fuzz tools \
             \( -name '*.hpp' -o -name '*.cpp' -o -name '*.h' \) -print0 \
             | xargs -0 clang-format --dry-run --Werror
 
@@ -62,7 +71,7 @@ jobs:
       ASAN_OPTIONS: abort_on_error=1:detect_container_overflow=0
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: lukka/get-cmake@latest
       - name: Configure
         run: |
@@ -82,8 +91,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ASAN_OPTIONS: detect_container_overflow=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: lukka/get-cmake@latest
       - name: Configure
         run: |
@@ -92,8 +102,9 @@ jobs:
             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DFBREQUEST_BUILD_TESTS=OFF \
+            -DFBREQUEST_BUILD_TOOLS=OFF \
             -DFBREQUEST_BUILD_FUZZERS=ON \
-            -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer"
+            -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
       - name: Build fuzzer
         run: cmake --build build --target fbrequest_fuzz_parse
       - name: Run fuzzer
