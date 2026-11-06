@@ -75,7 +75,9 @@ cleared with `delete <union>`.
 
 An index into a fixed-length array must be less than its length. A `put` (and a
 `patch`) may not index a vector so far that the vector, grown to reach it,
-would be larger than a flatbuffer can hold.
+would be larger than a flatbuffer can hold. The apply counts what the
+caller's builder already holds against that bound too, alone or in a patch,
+and refuses a put past it; a put it applies grows the vector it names.
 
 ## put
 
@@ -158,13 +160,14 @@ builds nothing, so `patch { put i8 1 ; delete i16 }` on a buffer without
 `i16` writes no `i8` either. A caller that treats a delete of something absent
 as success keeps its source only for a lone `delete`: a patch answering
 `NotStored` made none of its edits. An empty patch names no edit, and is
-applied as a copy.
+applied as a copy, where its path is one a patch takes.
 
 The patched object must be a table or a struct that a `put` could reach,
 an element of a vector of structs included
 (`patch struct_vector[1] { put i8 5 ; put i16 6 }`): a whole vector, an array
 of structs or an element of one, and a union with no member named are
-refused, even for a patch holding only deletes.
+refused, even for a patch holding only deletes or none. The apply refuses a
+hand-built patch stopping at one too.
 
 ## Applying a request
 

@@ -96,6 +96,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   string holding a control character or text that is not UTF-8.
 
 ### Fixed
+- A `put` growing a vector to just under the bound on its size was reported
+  `Applied` with the vector left as stored. The bound was checked against the
+  builder's size before anything was built, and again by the builder after
+  the fields before the vector were copied into it, which fell back to the
+  stored vector where the second check failed; in a patch the first check
+  ignored the caller's builder altogether. The bound is now decided once,
+  against the caller's builder as it is on entry, alone or in a patch, and a
+  put it accepts grows the vector, for vectors of scalars, strings, tables,
+  unions and structs alike. It counts the vectors a request grows together:
+  a vector grown inside an element of another (`put
+  object_vector[N].i32_vector[M] 7`), and the vectors the puts of one patch
+  grow, each of which passed the bound alone.
+- A whole-vector `put` of scalars, strings or tables was not bounded at all,
+  and a payload whose elements share one string or table builds a copy per
+  element, so a small payload could build past what a flatbuffer holds. It
+  is bounded as a vector of structs already was.
+- A hand-built `patch` whose path stops at a scalar, a string, a whole
+  vector, a union with no member named, or anything in an array was applied
+  as though each of its operations' paths continued its own: `patch i8
+  { put <empty path> 5 }` wrote `i8`, `patch i32_vector { delete [0] }`
+  removed an element, and an empty patch at any path, resolved or not, was a
+  copy. Each is `Refused`, as the parser refuses its text. So is a request
+  missing a member the parser always writes: an operation's path, which was
+  read as the empty path (a put without one replaced the whole root, and
+  inside `patch object { ... }` a delete without one removed `object`), or a
+  patch's operations and their types (a patch without them was a copy).
+- `copyTable` pooled strings whatever its `useStringPooling` argument said.
+  It pools them only where asked.
 - What a request does not edit was copied wrongly, or the copy faulted, for
   several kinds of field. The apply copied with FlatBuffers' `CopyTable`,
   which reads every union member as a table, copies a vector of unions as
