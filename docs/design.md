@@ -9,7 +9,15 @@
    [schemas/fbrequest/FlatbufferRequest.fbs](../schemas/fbrequest/FlatbufferRequest.fbs)).
    Each operation stores an **offset path** (a `[uint32]` vector of vtable
    offsets / vector indices / union discriminants) plus, for `put`, a
-   flexbuffer-encoded payload.
+   payload: a flatbuffer of the table it writes for a table, a union member
+   or an element of a vector of tables, and a flexbuffer for anything else
+   (a whole vector of tables as a flexbuffer list of such flatbuffers).
+   Which it is follows from what the path names in the target schema, so the
+   `Request` schema gives the payload no `flexbuffer` or `nested_flatbuffer`
+   attribute: its generated verifier, `serialized::VerifyRequestBuffer`,
+   checks the payload only as bytes, and passes every request the parser
+   writes. The apply verifies each payload as its path's kind before reading
+   it.
 
 2. **Apply** ([src/FlatbufferRequestApply.cpp](../src/FlatbufferRequestApply.cpp)) —
    walks the target reflection schema and rebuilds the buffer, copying every

@@ -6,7 +6,8 @@
 // Two readings of the bytes: as a Request buffer, applied where it passes
 // the Request verifier; and as a recipe for one, built from the field
 // offsets, member values, indices and payloads the test schema gives, which
-// reaches far more of the apply than verifying bytes do.
+// reaches far more of the apply than verifying bytes do. A recipe's request
+// must pass the Request verifier too, as the apply requires.
 //
 // Build with -DFBREQUEST_BUILD_FUZZERS=ON using a Clang toolchain; see
 // fuzz/CMakeLists.txt.
@@ -495,11 +496,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   auto type = serialized::Operation::NONE;
   const auto operation =
       buildOperation(fbb, reader, 0, fixture().schema->root_table(), &type);
-  // Not checked by the Request verifier, which reads every put's payload as
-  // a flexbuffer and so refuses a table put. The builder lays out what the
-  // verifier checks besides, and the recipe pairs every operation with its
-  // type, as the verifier asks.
   fbb.Finish(serialized::CreateRequest(fbb, type, operation));
+  // The apply takes only a request that passes the Request verifier, which
+  // every recipe is built to: each operation is paired with its type, or
+  // with one the verifier does not read (NONE, or one the union does not
+  // declare).
+  auto verifier = flatbuffers::Verifier(fbb.GetBufferPointer(), fbb.GetSize());
+  if (not serialized::VerifyRequestBuffer(verifier)) {
+    fail("a request built from a recipe does not pass the Request verifier");
+  }
   applyToEverySource(fbb.GetBufferPointer(), heldBytes);
   return 0;
 }

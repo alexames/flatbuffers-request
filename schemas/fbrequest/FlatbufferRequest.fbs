@@ -1,9 +1,18 @@
 // Schema for serialized FlatbufferRequest operations (put / patch / delete).
 //
-// A Request wraps a single Operation. Put stores a flexbuffer-encoded payload
-// plus the reflection offset path to the target field; Patch carries a nested
-// list of operations applied relative to a subobject; Delete removes the field
-// or vector element identified by its offset path.
+// A Request wraps a single Operation. Put stores a payload plus the
+// reflection offset path to the target field; Patch carries a nested list of
+// operations applied relative to a subobject; Delete removes the field or
+// vector element identified by its offset path.
+//
+// A put's payload is a flatbuffer whose root is the table it writes, for a
+// table, a union member or an element of a vector of tables; a flexbuffer
+// list of such flatbuffers for a whole vector of tables; and a flexbuffer
+// value for anything else. Which one it is follows from what the path
+// names in the target schema, which this schema does not know, so the
+// payload carries no `flexbuffer` or `nested_flatbuffer` attribute: the
+// Request verifier checks it only as bytes, and the apply verifies it as the
+// kind its path calls for before reading it.
 //
 // An offset path is a sequence of field vtable offsets, element indices and
 // union member values. It is 32 bits wide so that any index a vector's 32-bit
@@ -19,7 +28,7 @@ union Operation {
 
 table Put {
   offsets: [uint32];
-  payload: [uint8] (flexbuffer);
+  payload: [uint8];
 }
 
 table Patch {

@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -109,6 +111,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
   auto parsed = fbrequest::parseFlatbufferRequest(schema, request);
   if (parsed) {
+    // The apply takes only a request that passes the Request verifier, so
+    // every request the parser writes must pass it.
+    auto verifier = flatbuffers::Verifier(parsed->data(), parsed->size());
+    if (not serialized::VerifyRequestBuffer(verifier)) {
+      std::fprintf(stderr, "a parsed request does not pass the verifier
+");
+      std::abort();
+    }
     const auto* root =
         flatbuffers::GetRoot<serialized::Request>(parsed->data());
     if (not operationFits(root->operation_type(), root->operation())) {
