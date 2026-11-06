@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- The serialized `Request`'s offset paths (`Put.offsets`, `Patch.offsets`,
+  `Delete.offsets`) are `[uint32]` rather than `[uint16]`, so that any element
+  index a vector can hold is carried whole. A request serialized by an earlier
+  release does not apply with this one; re-parse its text.
+- `delete <union>` (`delete number`) and `delete <union vector>[i]` now parse,
+  and clear the union or remove the element, whichever member it holds. A
+  path stopping at a union is still refused for a `put` and a `patch`, where
+  nothing says which member the payload is.
+- `delete <union>.<member>`, and `delete <union vector>[i].<member>`, where
+  the buffer holds another member, are now a no-op, as a delete of a field of
+  such a member already was. They removed the member the buffer did hold.
+- A `patch` takes only a path a `put` could, since its operations may be
+  puts: one into a vector or array of structs, or naming no member of a union,
+  is refused even when it holds only deletes.
+- A hand-built `put` of a union-vector element naming a member that holds no
+  table (`NONE`, or an undeclared value) leaves the vector as stored, as it
+  does for a single union. It wrote an empty element.
+
 ### Fixed
 - A `put` read the flatbuffer or flexbuffer its payload carries in place,
   even where it did not start on an 8-byte boundary: the request's payload
@@ -57,6 +76,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A whole-vector `put` of a vector of unions read the union's enum index as an
   object index. No payload carries the members' types, so nothing is built
   for one; the parser already refused it.
+- An element index above 65535 was truncated to the 16 bits a path carried,
+  so `put i32_vector[70000] 5` wrote element 4464 and
+  `delete i32_vector[65537]` removed element 1. Paths are now 32 bits wide.
+  A `put` (or `patch`) whose index would grow one vector past half of what a
+  flatbuffer can hold is refused by the parser, and a hand-built one writes
+  nothing, so the growth an index asks for leaves room for the table around
+  it.
+- A negative index (`put i32_vector[-1] 5`) wrapped to the top of the path's
+  range, and a bracket holding no whole index (`delete i32_vector[x]`,
+  `delete i32_vector[1`) was read as the vector itself, removing all of it.
+  Both are refused.
+- A grown vector of unions was padded with discriminant 1, which names no
+  member where the union's first member is given another value
+  (`union U { A = 2, B }`). Padding is now the first member that holds a
+  table. A hand-built request naming a member value past 255 was truncated to
+  a declared one; it now names no member and writes nothing.
+- A request naming a union's `_type` discriminator (`put number_type 2`,
+  `put number_vector_type[0] 2`, `delete number_type`) was reported applied
+  while the table was rebuilt with the union as stored. It is refused.
+- An index past the end of a fixed-length array (`put scalars.i32_array[99] 1`)
+  parsed and wrote nothing. It is refused.
+- An index into something that is not a vector or an array (`put i8[0] 1`), or
+  a second index into an element (`put i32_vector[0][1] 5`), was left for the
+  payload parser, which read the bracket as the value. It is refused, and so
+  is any text after the operation (`delete i8 i16` deleted only `i8`).
+- `delete struct_vector[0].i8` removed the whole element; it is now a no-op,
+  as a delete inside a struct field is.
+- A `patch` whose path is a vector or array of structs, or an element of one
+  (`patch struct_vector { put i8 1 }`), parsed, and its puts read the patched
+  field's offset as an element index or built nothing. It is refused, as a
+  `put` there is.
+- A union member that is a struct (possible in a schema generated for C++
+  alone) was read as a table: a path into one, and a stored one copied
+  because the request edited something else, read its bytes as a vtable. A
+  path into one is refused, and a stored one is copied as its bytes, in a
+  union and in a vector of unions.
+- A `patch` whose path is a whole vector of tables
+  (`patch object_vector { put i8 1 }`), and a path continuing past one
+  (`delete object_vector.i8`, `delete struct_vector.i8`), read the next
+  field's offset as an element index: the delete removed element 6, or
+  element 1, and the put read its payload as a table. Both are refused.
 
 ## [0.4.1] - 2026-09-20
 

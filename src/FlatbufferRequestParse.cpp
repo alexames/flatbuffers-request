@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <optional>
 #include <span>
 #include <string>
 
+#include "ElementIndex.hpp"
 #include "StringScan.hpp"
 #include "fbrequest/FlatbufferRequest.hpp"
 #include "flatbuffers/flatbuffers.h"
@@ -42,12 +44,17 @@ const reflection::Enum* getUnionEnum(const reflection::Schema* schema,
   return schema->enums()->Get(unionField->type()->index());
 }
 
+// Resolves the `.Member` after a union field or a union-vector element,
+// pushing the member's value. A path that names no member resolves to the
+// union whole, which only a delete takes: it clears the union, or removes the
+// element. Nothing says which member a written payload is.
 bool parseFlatbufferOffsetPath_ParseUnionName(
     const reflection::Schema* schema, const reflection::Field* field,
-    std::string_view* path, std::vector<uint16_t>* outOffsets,
-    const reflection::Object** outObject) {
+    std::string_view* path, std::vector<uint32_t>* outOffsets,
+    const reflection::Object** outObject, bool writing) {
   if (not advanceOver(*path, ".")) {
-    return false;
+    *outObject = nullptr;
+    return not writing;
   }
   const std::string_view unionName = path->substr(0, findAnyOf(*path, ".[ "));
   if (unionName.empty()) {
@@ -64,20 +71,36 @@ bool parseFlatbufferOffsetPath_ParseUnionName(
     return false;
   }
   // NONE is a member of every union and holds no table: there is no object
-  // for the path to continue into or for a payload to be parsed against.
+  // for the path to continue into or for a payload to be parsed against. A
+  // struct member is refused too: the apply reads every member as a table.
   const auto* memberType = unionValue->union_type();
   if (memberType == nullptr or memberType->base_type() != reflection::Obj) {
     return false;
   }
-  outOffsets->push_back(unionValue->value());
-  *outObject = schema->objects()->Get(memberType->index());
+  const auto* memberDef = schema->objects()->Get(memberType->index());
+  if (memberDef->is_struct()) {
+    return false;
+  }
+  outOffsets->push_back(static_cast<uint32_t>(unionValue->value()));
+  *outObject = memberDef;
   return true;
 }
 
-// `writing` refuses the paths only a `put` cannot serve: a delete resolves
-// the same text and removes a whole element, which is well defined where
-// writing one is not.
-std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
+// Whether `field` is a union's discriminator, or a vector of unions' vector of
+// them. The apply writes either only from the union beside it, so a request
+// naming one would be reported applied with nothing written. A union is
+// switched by `put <union>.<member> ...` and cleared by `delete <union>`.
+bool isUnionDiscriminator(const reflection::Field* field) {
+  const auto* type = field->type();
+  return type->base_type() == reflection::UType
+         or (type->base_type() == reflection::Vector
+             and type->element() == reflection::UType);
+}
+
+// `writing` refuses the paths only a `put` cannot serve, for a put and for a
+// patch, whose operations may be puts: a delete resolves the same text and
+// removes a whole element, which is well defined where writing one is not.
+std::optional<Offset<Vector<uint32_t>>> parseFlatbufferOffsetPath(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
     std::string_view* path, const reflection::Type** outType,
     const reflection::Object** outObject, bool* outElementInVector,
@@ -93,7 +116,7 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
     return std::nullopt;
   }
 
-  auto offsets = std::vector<uint16_t>{};
+  auto offsets = std::vector<uint32_t>{};
   do {
     *outElementInVector = false;
     if (*outObject == nullptr) {
@@ -111,19 +134,36 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
       return std::nullopt;
     }
 
+    if (isUnionDiscriminator(*field)) {
+      return std::nullopt;
+    }
     offsets.push_back(field->offset());
 
     auto type = *outType = field->type();
     switch (type->base_type()) {
       case reflection::Array:
       case reflection::Vector: {
-        std::optional<int> arrayIndex;
-        if (advanceOver(*path, "[") and (arrayIndex = advanceOverInt(*path))
-            and advanceOver(*path, "]")) {
-          // Getting a path to a specific element in the vector.
+        if (advanceOver(*path, "[")) {
+          // Getting a path to a specific element in the vector. A bracket
+          // that does not hold a whole index is refused rather than read as
+          // the vector itself.
+          const auto arrayIndex = advanceOverIndex(*path);
+          if (not arrayIndex or not advanceOver(*path, "]")) {
+            return std::nullopt;
+          }
+          const auto elementBaseType = type->element();
+          const auto indexReachable =
+              (type->base_type() == reflection::Array)
+                  ? *arrayIndex < type->fixed_length()
+                  : not writing
+                        or vectorCanGrowTo(elementBaseType, *arrayIndex);
+          if (not indexReachable) {
+            // An array cannot grow, so the element is not there; a vector
+            // that grew to reach it would not fit in a flatbuffer.
+            return std::nullopt;
+          }
           *outElementInVector = true;
           offsets.push_back(*arrayIndex);
-          auto elementBaseType = field->type()->element();
           if (elementBaseType == reflection::Obj) {
             const auto* elementDef = schema->objects()->Get(type->index());
             if (writing and elementDef->is_struct()) {
@@ -135,7 +175,7 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
             *outObject = elementDef;
           } else if (elementBaseType == reflection::Union) {
             if (not parseFlatbufferOffsetPath_ParseUnionName(
-                    schema, *field, path, &offsets, outObject)) {
+                    schema, *field, path, &offsets, outObject, writing)) {
               return std::nullopt;
             }
           } else {
@@ -160,6 +200,12 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
             // from. Neither is written here.
             return std::nullopt;
           }
+          if (path->starts_with(".")) {
+            // The element type is what a whole-vector payload is parsed as,
+            // not an object the path steps into: the next step would be read
+            // as an element index.
+            return std::nullopt;
+          }
           *outObject = elementDef;
         }
         break;
@@ -169,8 +215,8 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
         break;
       }
       case reflection::Union: {
-        if (not parseFlatbufferOffsetPath_ParseUnionName(schema, *field, path,
-                                                         &offsets, outObject)) {
+        if (not parseFlatbufferOffsetPath_ParseUnionName(
+                schema, *field, path, &offsets, outObject, writing)) {
           return std::nullopt;
         }
         break;
@@ -180,13 +226,18 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
       }
     }
   } while (not path->empty() and advanceOver(*path, "."));
+  if (path->starts_with("[")) {
+    // An index into something that is not a vector or an array, or a second
+    // one into an element: left here, it would be parsed as the payload.
+    return std::nullopt;
+  }
   return fbb.CreateVector(offsets);
 }
 
 std::optional<Offset<Put>> parseFlatbufferPut_ParseVector(
     FlatBufferBuilder& fbb, std::string_view* requestString,
     const reflection::Schema* schema, const reflection::Object* typeObject,
-    Offset<Vector<uint16_t>>& offsets) {
+    Offset<Vector<uint32_t>>& offsets) {
   // Parsing a vector.
   auto parser = Parser{};
   parser.opts.require_json_eof = false;
@@ -224,7 +275,7 @@ std::optional<Offset<Put>> parseFlatbufferPut_ParseVector(
 std::optional<Offset<Put>> parseFlatbufferPut_ParseTable(
     FlatBufferBuilder& fbb, std::string_view* requestString,
     const reflection::Schema* schema, const reflection::Object* typeObject,
-    Offset<Vector<uint16_t>>& offsets) {
+    Offset<Vector<uint32_t>>& offsets) {
   auto parser = Parser{};
   // Allow trailing content so a caller (e.g. a patch's update list) can keep
   // parsing after the payload.
@@ -268,7 +319,7 @@ bool payloadTypeAccepts(reflection::BaseType payloadType,
 
 std::optional<Offset<Put>> parseFlatbufferPut_ParsePrimitive(
     FlatBufferBuilder& fbb, std::string_view* requestString,
-    Offset<Vector<uint16_t>>& offsets, reflection::BaseType payloadType) {
+    Offset<Vector<uint32_t>>& offsets, reflection::BaseType payloadType) {
   auto parser = Parser{};
   if (not parser.ParseFlexBuffer(requestString->data(), nullptr,
                                  &parser.flex_builder_)) {
@@ -351,18 +402,25 @@ std::optional<Offset<Patch>> parseFlatbufferPatch(
 
   advanceOver(*requestString, " ");
 
-  std::optional<Offset<Vector<uint16_t>>> offsets;
+  std::optional<Offset<Vector<uint32_t>>> offsets;
   const reflection::Object* targetObject = baseObject;
   if (requestString->starts_with("{")) {
-    offsets = fbb.CreateVector(std::vector<uint16_t>{});
+    offsets = fbb.CreateVector(std::vector<uint32_t>{});
   } else {
     const reflection::Type* type = nullptr;
     bool elementInVector = false;
     offsets =
         parseFlatbufferOffsetPath(fbb, schema, requestString, &type,
-                                  &targetObject, &elementInVector, baseObject);
-    if (not offsets or targetObject == nullptr) {
-      return std::nullopt;  // a patch target must be a table
+                                  &targetObject, &elementInVector, baseObject,
+                                  /*writing=*/true);
+    // A patch target must be a table, or a struct: a whole vector names its
+    // element type, but the patch's operations would step into the vector
+    // with their own first step read as an element index.
+    const auto wholeVector = type != nullptr
+                             and type->base_type() == reflection::Vector
+                             and not elementInVector;
+    if (not offsets or targetObject == nullptr or wholeVector) {
+      return std::nullopt;
     }
   }
 
@@ -482,6 +540,12 @@ std::optional<fbrequest::ByteBuffer> fbrequest::parseFlatbufferRequest(
   auto operationOffset =
       parseFlatbufferOperation(fbb, &requestString, *operation, schema);
   if (not operationOffset) {
+    return std::nullopt;
+  }
+  // Text after the operation would name an edit nobody makes.
+  requestString.remove_prefix(std::min(
+      requestString.find_first_not_of(" \t\r\n"), requestString.size()));
+  if (not requestString.empty()) {
     return std::nullopt;
   }
   auto requestOffset = CreateRequest(fbb, *operation, *operationOffset);

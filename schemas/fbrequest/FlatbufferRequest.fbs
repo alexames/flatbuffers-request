@@ -4,6 +4,10 @@
 // plus the reflection offset path to the target field; Patch carries a nested
 // list of operations applied relative to a subobject; Delete removes the field
 // or vector element identified by its offset path.
+//
+// An offset path is a sequence of field vtable offsets, element indices and
+// union member values. It is 32 bits wide so that any index a vector's 32-bit
+// length allows is carried whole.
 
 namespace serialized;
 
@@ -14,17 +18,17 @@ union Operation {
 }
 
 table Put {
-  offsets: [uint16];
+  offsets: [uint32];
   payload: [uint8] (flexbuffer);
 }
 
 table Patch {
-  offsets: [uint16];
+  offsets: [uint32];
   updates: [Operation];
 }
 
 table Delete {
-  offsets: [uint16];
+  offsets: [uint32];
 }
 
 table Request {

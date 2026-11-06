@@ -17,8 +17,10 @@ bool advanceOver(std::string_view& str, std::string_view target) {
   return false;
 }
 
-std::optional<int> advanceOverInt(std::string_view& str) {
-  int index = 0;
+std::optional<uint32_t> advanceOverIndex(std::string_view& str) {
+  // Unsigned, so a sign is refused rather than read: a negative index would
+  // wrap to the top of the range.
+  uint32_t index = 0;
   auto [ptr, error] =
       std::from_chars(str.data(), str.data() + str.size(), index);
   if (error == std::errc::invalid_argument

@@ -7,7 +7,7 @@
 1. **Parse** ([src/FlatbufferRequestParse.cpp](../src/FlatbufferRequestParse.cpp)) —
    turns request text into a serialized `Request` flatbuffer (schema in
    [schemas/fbrequest/FlatbufferRequest.fbs](../schemas/fbrequest/FlatbufferRequest.fbs)).
-   Each operation stores an **offset path** (a `[uint16]` vector of vtable
+   Each operation stores an **offset path** (a `[uint32]` vector of vtable
    offsets / vector indices / union discriminants) plus, for `put`, a
    flexbuffer-encoded payload.
 
@@ -59,7 +59,8 @@ payload into that image, and pushes it inline.
 A `put` is REFUSED, rather than served wrongly, for:
 
 - an element of a vector or array **of structs** (`put struct_vector[0].i8 5`,
-  `put nested.structs[0].a 2`) and a whole vector of structs. A struct element
+  `put nested.structs[0].a 2`) and a whole vector or array of structs, and a
+  `patch` of one, whose operations would be puts into it. A struct element
   is inline: apply builds no offset for one while the table builder still
   consumes one, which would read a neighbouring field's offset.
 - a whole vector of **unions**, whose element types live in a second vector

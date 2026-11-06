@@ -3,6 +3,7 @@
 //
 // Build with -DFBREQUEST_BUILD_FUZZERS=ON using a Clang toolchain; see
 // fuzz/CMakeLists.txt.
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -61,6 +62,45 @@ const std::vector<uint8_t>& emptyRoot() {
   return root;
 }
 
+// A put may grow a vector to any index a flatbuffer can hold, up to a
+// gigabyte: correct, and more than the fuzzer's memory limit. A put or patch
+// whose path steps past this is parsed but not applied; a delete builds
+// nothing to reach an index, so it is applied whatever its path.
+constexpr uint32_t kLargestAppliedPathValue = 1U << 16;
+
+bool pathFits(const flatbuffers::Vector<uint32_t>* offsets) {
+  return offsets == nullptr
+         or std::ranges::all_of(*offsets, [](uint32_t value) {
+              return value <= kLargestAppliedPathValue;
+            });
+}
+
+bool operationFits(serialized::Operation type, const void* operation) {
+  switch (type) {
+    case serialized::Operation::Put:
+      return pathFits(
+          static_cast<const serialized::Put*>(operation)->offsets());
+    case serialized::Operation::Patch: {
+      const auto* patch = static_cast<const serialized::Patch*>(operation);
+      if (not pathFits(patch->offsets())) {
+        return false;
+      }
+      if (patch->updates() == nullptr or patch->updates_type() == nullptr) {
+        return true;
+      }
+      for (flatbuffers::uoffset_t i = 0; i < patch->updates()->size(); i++) {
+        if (not operationFits(patch->updates_type()->Get(i),
+                              patch->updates()->Get(i))) {
+          return false;
+        }
+      }
+      return true;
+    }
+    default:
+      return true;
+  }
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
@@ -69,6 +109,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
   auto parsed = fbrequest::parseFlatbufferRequest(schema, request);
   if (parsed) {
+    const auto* root =
+        flatbuffers::GetRoot<serialized::Request>(parsed->data());
+    if (not operationFits(root->operation_type(), root->operation())) {
+      return 0;
+    }
     flatbuffers::FlatBufferBuilder fbb;
     fbb.Finish(fbrequest::applyRequest(
         fbb, schema, flatbuffers::GetAnyRoot(emptyRoot().data()),
