@@ -10,7 +10,7 @@ patch player { put name "Aria" ; delete title }
 delete inventory[3]
 ```
 
-> Status: **v0.4.1**, extracted from the [Composer](https://github.com/alexames) engine's editor. Tables, vectors, unions, strings, scalars, enums and structs are supported, including fixed-size arrays inside a struct. Vectors of structs are not yet edited element-by-element.
+> Status: **v0.4.1**, extracted from the [Composer](https://github.com/alexames) engine's editor. Tables, vectors, unions, strings, scalars, enums and structs are supported, including fixed-size arrays inside a struct. Vectors of structs are not yet edited element-by-element in a release; the unreleased changes edit them by member, by element or whole (see [CHANGELOG.md](CHANGELOG.md)).
 
 ## Install (vcpkg)
 
@@ -81,7 +81,7 @@ The public API is in namespace `fbrequest` ([include/fbrequest/FlatbufferRequest
 
 See [docs/grammar.md](docs/grammar.md) for the full grammar. In brief:
 
-- **`put <path> <value>`** — set a scalar, string, table, union member, vector, or vector element. Missing intermediate objects/elements are created; vectors grow (zero/empty-padded) as needed.
+- **`put <path> <value>`** — set a scalar, string, table, union member, struct, vector, or vector element, or a member of a struct or of an element of a vector of structs. Missing intermediate objects/elements are created; vectors grow (zero/empty-padded) as needed.
 - **`delete <path>`** — remove a field, a whole vector, or one vector element. Deleting something the buffer does not store builds nothing and answers `NotStored`.
 - **`patch <path> { <op> ; <op> ; ... }`** — apply a sequence of operations relative to the object at `<path>` (empty path patches the target directly). Patches nest.
 

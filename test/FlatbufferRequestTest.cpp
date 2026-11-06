@@ -1,6 +1,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -883,23 +884,6 @@ TEST_F(RefusedPutTest, RefusesAStructPayloadThatIsNotAMap) {
   EXPECT_FALSE(parseFlatbufferRequest(schema_, "put scalars 5").has_value());
 }
 
-TEST_F(RefusedPutTest, RefusesWritingAnElementOfAVectorOfStructs) {
-  // The apply builds no offset for an inline element while the table builder
-  // still consumes one, which reads a neighbouring field's offset.
-  EXPECT_FALSE(
-      parseFlatbufferRequest(schema_, "put struct_vector[0].i8 5").has_value());
-  EXPECT_FALSE(
-      parseFlatbufferRequest(schema_, R"(put struct_vector [{"i8": 1}])")
-          .has_value());
-}
-
-TEST_F(RefusedPutTest, StillDeletesAnElementOfAVectorOfStructs) {
-  // A delete removes a whole element, which is well defined where writing one
-  // is not, so the refusal above must not reach it.
-  EXPECT_TRUE(
-      parseFlatbufferRequest(schema_, "delete struct_vector[0]").has_value());
-}
-
 TEST_F(RefusedPutTest, RefusesAUnionMemberThatHoldsNoTable) {
   // NONE is a member of every union, and names no object for the path to
   // continue into or the payload to be parsed against.
@@ -1387,8 +1371,8 @@ TEST_F(NestedStructTest, PutsAMemberAfterANestedStructWithoutDisturbingIt) {
 }
 
 TEST_F(NestedStructTest, RefusesAnElementOfAnArrayOfStructs) {
-  // The same rule as a vector of structs: the element is inline and nothing
-  // builds one.
+  // The struct writer reaches no element of an array of structs, inline in
+  // its struct, whose stride it does not compute.
   EXPECT_FALSE(
       parseFlatbufferRequest(schema_, "put nested.structs[0].a 2").has_value());
 }
@@ -1827,15 +1811,16 @@ TEST_F(PathResolutionTest, RefusesAPatchOfWhatAPutCannotWrite) {
   EXPECT_FALSE(parses("patch struct_vector { put i8 1 }"));
   EXPECT_FALSE(parses("patch object_vector { put i8 1 }"));
   EXPECT_FALSE(parses("patch object_vector { delete i8 }"));
-  EXPECT_FALSE(parses("patch struct_vector[0] { put i8 1 }"));
   EXPECT_FALSE(parses("patch object_vector[4000000000] { put i8 1 }"));
   EXPECT_TRUE(parses("patch object_vector[3] { put i8 1 }"));
+  EXPECT_TRUE(parses("patch struct_vector[0] { put i8 1 }"));
 }
 
 // A scalar's value is checked against the scalar it is written as, wherever
 // the scalar is: a field, an element of a vector, a member of a struct, an
-// element of an array in one, a member named in a struct's map, or an
-// element of a whole vector or array.
+// element of an array in one, a member named in a struct's map, a member of
+// an element of a vector of structs, or an element of a whole vector or
+// array.
 class ScalarValueTest : public BufferRequestTest {
  protected:
   // Every request writing `value` as the scalar `field` names, at each of the
@@ -1851,6 +1836,8 @@ class ScalarValueTest : public BufferRequestTest {
         "put " + field + "_vector [0, " + value + "]",
         "put scalars." + field + " " + value,
         "put scalars {\"" + field + "\": " + value + "}",
+        "put struct_vector[0]." + field + " " + value,
+        "put struct_vector[1] {\"" + field + "\": " + value + "}",
         "put object." + field + " " + value,
         "patch { put " + field + " " + value + " }",
     };
@@ -1861,6 +1848,7 @@ class ScalarValueTest : public BufferRequestTest {
   static std::vector<std::string> intoArray(const std::string& value) {
     return {
         "put scalars.i32_array[1] " + value,
+        "put struct_vector[0].i32_array[1] " + value,
         "put scalars.i32_array [" + value + "]",
         "put scalars {\"i32_array\": [1, " + value + "]}",
     };
@@ -2262,5 +2250,752 @@ TEST_F(HandBuiltTest, RefusesAScalarPayloadOfAnotherKind) {
   EXPECT_EQ(putOutcome(initial, {fieldOffset("i64")}, top.GetBuffer()),
             ApplyOutcome::Refused);
   EXPECT_EQ(putOutcome(initial, {fieldOffset("ui64")}, top.GetBuffer()),
+            ApplyOutcome::Applied);
+}
+
+// A vector of structs holds its elements inline, at the struct's size and
+// alignment, with no offset or vtable of its own: a put writes a member of an
+// element, an element by a map, or the vector whole, and a delete removes an
+// element, each by rebuilding the vector around the bytes it changes.
+class StructVectorTest : public BufferRequestTest {
+ protected:
+  /// `buffer` as text, every struct member included. The comparator the
+  /// table tests use compares only whether a struct is stored, so these tests
+  /// compare the text the FlatBuffers generator writes for each buffer.
+  std::string textOf(const uint8_t* buffer) {
+    flatbuffers::Parser parser;
+    parser.opts.indent_step = -1;
+    EXPECT_TRUE(parser.Deserialize(schema_));
+    auto text = std::string{};
+    EXPECT_EQ(flatbuffers::GenText(parser, buffer, &text), nullptr);
+    return text;
+  }
+
+  /// Checks that `request` applies to the buffer `initial` spells and comes
+  /// to the buffer `expected` spells.
+  void expectEdit(const std::string& initial, std::string_view request,
+                  const std::string& expected) {
+    const auto result = applyRequestTo(GetBuffer(initial), request);
+    EXPECT_EQ(textOf(result.data()), textOf(GetBuffer(expected).data()))
+        << request;
+  }
+
+  /// A table whose `holder_vector` holds the elements `elements` spells.
+  static std::string holders(const std::string& elements) {
+    return R"({"holder_vector": [)" + elements + "]}";
+  }
+
+  /// A Holder as a map naming every member.
+  static std::string holder(int a, std::array<int, 3> arr, int tail) {
+    return R"({"inner": {"a": )" + std::to_string(a) + R"(, "arr": [)"
+           + std::to_string(arr[0]) + ", " + std::to_string(arr[1]) + ", "
+           + std::to_string(arr[2]) + R"(]}, "tail": )" + std::to_string(tail)
+           + "}";
+  }
+
+  static std::string twoHolders() {
+    return holder(1, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 9);
+  }
+
+  static std::string zeroHolder() { return holder(0, {0, 0, 0}, 0); }
+};
+
+TEST_F(StructVectorTest, WritesAMemberOfAnElement) {
+  const auto initial = holders(twoHolders());
+  expectEdit(
+      initial, "put holder_vector[1].tail 10",
+      holders(holder(1, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 10)));
+  expectEdit(
+      initial, "put holder_vector[0].inner.a -7",
+      holders(holder(-7, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 9)));
+  expectEdit(
+      initial, "put holder_vector[1].inner.arr[2] 70",
+      holders(holder(1, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 70}, 9)));
+  // A whole array, or a nested struct by map, as for a struct field: what
+  // the value does not reach keeps what it had.
+  expectEdit(
+      initial, "put holder_vector[0].inner.arr [10, 20]",
+      holders(holder(1, {10, 20, 3}, 4) + ", " + holder(5, {6, 7, 8}, 9)));
+  expectEdit(initial, R"(put holder_vector[0].inner {"a": 2})",
+             holders(holder(2, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 9)));
+}
+
+TEST_F(StructVectorTest, WritesAMemberPastTheFirstAtItsOwnOffset) {
+  auto result = applyRequestTo(
+      GetBuffer("{}"),
+      "patch { put wide_vector[1] {} ; "
+      "put wide_vector[1].ui64_array[1] 18446744073709551614 ; "
+      "put wide_vector[1].f32_array[1] 2.5 ; put wide_vector[1].b_array[1] 1 ; "
+      "put struct_vector[0].ui64 18446744073709551615 ; "
+      "put struct_vector[0].i32_array[9] -2147483648 ; "
+      "put struct_vector[0].f64 0.1 }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->wide_vector(), nullptr);
+  ASSERT_EQ(ts->wide_vector()->size(), 2U);
+  const auto* wide = ts->wide_vector()->Get(1);
+  EXPECT_EQ(wide->ui64_array()->Get(0), 0U);
+  EXPECT_EQ(wide->ui64_array()->Get(1), uint64_t{18446744073709551614U});
+  EXPECT_FALSE(wide->b_array()->Get(0));
+  EXPECT_TRUE(wide->b_array()->Get(1));
+  EXPECT_EQ(wide->f32_array()->Get(0), 0.0F);
+  EXPECT_EQ(wide->f32_array()->Get(1), 2.5F);
+  EXPECT_EQ(ts->wide_vector()->Get(0)->ui64_array()->Get(1), 0U);
+  ASSERT_NE(ts->struct_vector(), nullptr);
+  ASSERT_EQ(ts->struct_vector()->size(), 1U);
+  const auto* scalars = ts->struct_vector()->Get(0);
+  EXPECT_EQ(scalars->ui64(), uint64_t{18446744073709551615U});
+  EXPECT_EQ(scalars->i32_array()->Get(9), std::numeric_limits<int32_t>::min());
+  EXPECT_EQ(scalars->i32_array()->Get(8), 0);
+  EXPECT_EQ(scalars->f64(), 0.1);
+  EXPECT_EQ(scalars->i64(), 0);
+}
+
+TEST_F(StructVectorTest, WritesAnElementByAMapAndKeepsWhatItDoesNotName) {
+  const auto initial = holders(twoHolders());
+  expectEdit(initial, R"(put holder_vector[1] {"tail": 0})",
+             holders(holder(1, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 0)));
+  expectEdit(initial,
+             R"(put holder_vector[0] {"inner": {"arr": [0, 0, 0]}, "tail": 1})",
+             holders(holder(1, {0, 0, 0}, 1) + ", " + holder(5, {6, 7, 8}, 9)));
+  // A map naming no member names the element, which the buffer stores.
+  expectEdit(initial, "put holder_vector[0] {}", initial);
+}
+
+TEST_F(StructVectorTest, AppendsAZeroedElement) {
+  const auto initial = holders(twoHolders());
+  expectEdit(initial, "put holder_vector[2] {}",
+             holders(twoHolders() + ", " + zeroHolder()));
+  expectEdit(initial, R"(put holder_vector[2] {"tail": 3})",
+             holders(twoHolders() + ", " + holder(0, {0, 0, 0}, 3)));
+  expectEdit(initial, "put holder_vector[2].inner.arr[1] 3",
+             holders(twoHolders() + ", " + holder(0, {0, 3, 0}, 0)));
+}
+
+// As every other vector grows: a put naming an index past the end grows the
+// vector to reach it, and the elements between are zeroed, as a struct the
+// buffer does not store reads.
+TEST_F(StructVectorTest, GrowsTheVectorToAnIndexPastItsEnd) {
+  const auto initial = holders(twoHolders());
+  expectEdit(initial, "put holder_vector[3].tail 3",
+             holders(twoHolders() + ", " + zeroHolder() + ", "
+                     + holder(0, {0, 0, 0}, 3)));
+  expectEdit(initial, "put holder_vector[4] {}",
+             holders(twoHolders() + ", " + zeroHolder() + ", " + zeroHolder()
+                     + ", " + zeroHolder()));
+}
+
+TEST_F(StructVectorTest, StartsAVectorTheBufferDoesNotStore) {
+  expectEdit(R"({"i32": 3})", "put holder_vector[0] {}",
+             R"({"i32": 3, "holder_vector": [)" + zeroHolder() + "]}");
+  expectEdit("{}", "put holder_vector[1].inner.a 2",
+             holders(zeroHolder() + ", " + holder(2, {0, 0, 0}, 0)));
+  // And the tables on the path to it, as any put creates them.
+  expectEdit("{}", "put object.holder_vector[0].tail 1",
+             R"({"object": )" + holders(holder(0, {0, 0, 0}, 1)) + "}");
+  expectEdit("{}", "put object_vector[1].holder_vector[0] {}",
+             R"({"object_vector": [{}, )" + holders(zeroHolder()) + "]}");
+}
+
+// The element written is the one the path names, through a vector of tables
+// and through a union, in a field and in a vector of unions; the vectors of
+// structs beside it are copied as they were.
+TEST_F(StructVectorTest, EditsOnlyTheVectorAndElementThePathNames) {
+  const auto two = holders(twoHolders());
+  expectEdit(
+      R"({"object_vector": [)" + two + ", " + two + "]}",
+      "put object_vector[1].holder_vector[1].tail 0",
+      R"({"object_vector": [)" + two + ", "
+          + holders(holder(1, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 0))
+          + "]}");
+
+  const auto inner = [](const std::string& elements) {
+    return R"({"value": 3, "inner_vector": [)" + elements + "]}";
+  };
+  const auto inUnion = [&](const std::string& elements) {
+    return R"({"number_type": "Integer", "number": )" + inner(elements) + "}";
+  };
+  const auto a1 = std::string{R"({"a": 1, "arr": [1, 2, 3]})"};
+  const auto zero = std::string{R"({"a": 0, "arr": [0, 0, 0]})"};
+  expectEdit(inUnion(a1), "put number.Integer.inner_vector[0].a 4",
+             inUnion(R"({"a": 4, "arr": [1, 2, 3]})"));
+  expectEdit(inUnion(a1), "put number.Integer.inner_vector[1] {}",
+             inUnion(a1 + ", " + zero));
+  expectEdit(inUnion(a1 + ", " + zero), "delete number.Integer.inner_vector[0]",
+             inUnion(zero));
+  expectEdit(inUnion(a1),
+             R"(put number.Integer.inner_vector [{"a": 2, "arr": [3, 4, 5]}])",
+             inUnion(R"({"a": 2, "arr": [3, 4, 5]})"));
+
+  const auto inUnionVector = [&](const std::string& second) {
+    return R"({"number_vector_type": ["Integer", "Integer"], )"
+           R"("number_vector": [)"
+           + inner(a1) + ", " + inner(second) + "]}";
+  };
+  expectEdit(inUnionVector(a1),
+             "put number_vector[1].Integer.inner_vector[0].arr[1] 9",
+             inUnionVector(R"({"a": 1, "arr": [1, 9, 3]})"));
+  expectEdit(inUnionVector(a1), "put number_vector[1].Integer.inner_vector []",
+             R"({"number_vector_type": ["Integer", "Integer"], )"
+             R"("number_vector": [)"
+                 + inner(a1) + R"(, {"value": 3, "inner_vector": []}]})");
+}
+
+TEST_F(StructVectorTest, RemovesAnElement) {
+  const auto initial = holders(twoHolders());
+  expectEdit(initial, "delete holder_vector[0]",
+             holders(holder(5, {6, 7, 8}, 9)));
+  expectEdit(initial, "delete holder_vector[1]",
+             holders(holder(1, {1, 2, 3}, 4)));
+  // The last element removed leaves the vector stored, and empty.
+  expectEdit(holders(zeroHolder()), "delete holder_vector[0]", holders(""));
+}
+
+TEST_F(StructVectorTest, FindsNothingStoredForADeletePastTheEnd) {
+  EXPECT_EQ(
+      outcomeOf(GetBuffer(holders(twoHolders())), "delete holder_vector[2]"),
+      ApplyOutcome::NotStored);
+  EXPECT_EQ(outcomeOf(GetBuffer("{}"), "delete holder_vector[0]"),
+            ApplyOutcome::NotStored);
+  EXPECT_EQ(outcomeOf(GetBuffer("{}"), "delete object.holder_vector[0]"),
+            ApplyOutcome::NotStored);
+}
+
+TEST_F(StructVectorTest, RefusesADeleteInsideAnElement) {
+  for (const auto* request : {
+           "delete holder_vector[0].tail",
+           "delete holder_vector[0].inner",
+           "delete holder_vector[0].inner.a",
+           "delete holder_vector[0].inner.arr[1]",
+           "patch holder_vector[0] { delete tail }",
+           "patch holder_vector[0] { put tail 1 ; delete inner }",
+       }) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+}
+
+TEST_F(StructVectorTest, PutsAVectorWhole) {
+  // Members in any order, values in any spelling the value reader takes.
+  expectEdit(holders(twoHolders()),
+             R"(put holder_vector [{"tail": -4, "inner": {"arr": [0x10, +2, )"
+             R"(3], "a": -128}}, {inner: {a: 127, 'arr': [0, 0, 0]}, )"
+             R"(tail: 2147483647},])",
+             holders(holder(-128, {16, 2, 3}, -4) + ", "
+                     + holder(127, {0, 0, 0}, 2147483647)));
+  expectEdit(
+      R"({"i32": 1})",
+      "put holder_vector [\n  " + holder(1, {2, 3, 4}, 5) + "\n]",
+      R"({"i32": 1, "holder_vector": [)" + holder(1, {2, 3, 4}, 5) + "]}");
+  expectEdit(
+      "{}",
+      R"(put marker_vector [{"on": true, "color": 4}, {"on": 0, "color": 5}, )"
+      R"({"on": 1, "color": 0}])",
+      R"({"marker_vector": [{"on": true, "color": "Green"}, )"
+      R"({"on": false, "color": "Blue"}, {"on": true, "color": "Red"}]})");
+  expectEdit("{}",
+             R"(put wide_vector [{"ui64_array": [18446744073709551615, 0], )"
+             R"("b_array": [false, true], "f32_array": [1e1, -0.5]}])",
+             R"({"wide_vector": [{"ui64_array": [18446744073709551615, 0], )"
+             R"("b_array": [false, true], "f32_array": [10.0, -0.5]}]})");
+}
+
+TEST_F(StructVectorTest, StoresAnEmptyArrayAsAnEmptyVector) {
+  expectEdit(holders(twoHolders()), "put holder_vector []", holders(""));
+  expectEdit("{}", "put holder_vector [ ]", holders(""));
+}
+
+// A whole put replaces the elements the buffer stores, so there is no stored
+// value for a member it leaves out to keep: each element names every member
+// of its struct once, a nested struct every member of its own, and an array
+// every element.
+TEST_F(StructVectorTest, RefusesAWholeVectorOfAnotherShape) {
+  const auto complete = holder(1, {1, 2, 3}, 4);
+  const auto withTail = [](const std::string& arr, const std::string& tail) {
+    return R"(put holder_vector [{"inner": {"a": 1, "arr": )" + arr
+           + R"(}, "tail": )" + tail + "}]";
+  };
+  const auto wide = [](const std::string& ui64, const std::string& f32) {
+    return R"(put wide_vector [{"ui64_array": )" + ui64
+           + R"(, "b_array": [true, true], "f32_array": )" + f32 + "}]";
+  };
+  for (const auto& request : std::vector<std::string>{
+           "put holder_vector",
+           "put holder_vector {}",
+           "put holder_vector " + complete,
+           "put holder_vector [1]",
+           "put holder_vector [[1, 2]]",
+           "put holder_vector [{}]",
+           R"(put holder_vector [{"tail": 4}])",
+           "put holder_vector [" + complete + R"(, {"tail": 4}])",
+           R"(put holder_vector [{"inner": {"a": 1}, "tail": 4}])",
+           withTail("[1, 2, 3]", R"(4, "zzz": 5)"),
+           withTail("[1, 2, 3]", R"(4, "tail": 5)"),
+           // A member's value of the wrong kind or out of its range.
+           R"(put holder_vector [{"inner": 1, "tail": 4}])",
+           withTail("[1, 2, 3]", R"("4")"),
+           withTail("[1, 2, 3]", "1.5"),
+           withTail("[1, 2, 3]", "{}"),
+           withTail("[1, 2, 3]", "70000000000000000000"),
+           R"(put holder_vector [{"inner": {"a": 128, "arr": [1, 2, 3]}, )"
+           R"("tail": 4}])",
+           // An array of another length.
+           withTail("[1, 2]", "4"),
+           withTail("[1, 2, 3, 4]", "4"),
+           withTail("[]", "4"),
+           withTail("1", "4"),
+           R"(put marker_vector [{"on": 2, "color": 0}])",
+           R"(put marker_vector [{"on": true, "color": "Blue"}])",
+           R"(put marker_vector [{"on": true, "color": 256}])",
+           wide("[-1, 0]", "[0, 0]"),
+           wide("[18446744073709551616, 0]", "[0, 0]"),
+           wide("[0, 0]", "[1e39, 0]"),
+           wide("[0, 0]", "[infinite, 0]"),
+           // Broken punctuation, and text after the value.
+           "put holder_vector [" + complete,
+           R"(put holder_vector [{"inner": {"a": 1, "arr": [1, 2, 3]} )"
+           R"("tail": 4}])",
+           "put holder_vector [" + complete + "] []",
+           "put holder_vector [" + complete + ",,]",
+           // A key holding a NUL is no member's name.
+           "put marker_vector [{\"on\\u0000x\": true, \"color\": 0}]",
+       }) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+}
+
+TEST_F(StructVectorTest, RefusesAnElementValueOfTheWrongKind) {
+  for (const auto* request : {
+           R"(put holder_vector[0].tail "x")",
+           "put holder_vector[0].tail 1.5",
+           "put holder_vector[0].tail",
+           "put holder_vector[0].tail 1 2",
+           "put holder_vector[0].tail 2147483648",
+           "put holder_vector[0].inner 1",
+           "put holder_vector[0].inner {}",
+           "put holder_vector[0].inner.arr 1",
+           "put holder_vector[0].inner.arr []",
+           "put holder_vector[0].inner.arr [1, 2, 3, 4]",
+           "put holder_vector[0].inner.arr[3] 1",
+           "put holder_vector[0] 5",
+           "put holder_vector[0] [1]",
+           R"(put holder_vector[0] {"zzz": 1})",
+           R"(put holder_vector[0] {"tail": 1, "zzz": 2})",
+           R"(put holder_vector[0] {"tail": 1, "tail": 2})",
+           R"(put holder_vector[0] {"inner": {}})",
+           "put struct_vector[0].f32 x",
+           "put struct_vector[0].f32 1e39",
+           "put struct_vector[0].i64 9223372036854775808",
+           "put struct_vector[0].ui64 -1",
+           "put struct_vector[0].ui64 18446744073709551616",
+           "put marker_vector[0].on 2",
+           R"(put marker_vector[0].color "Blue")",
+           "put marker_vector[0].color 256",
+       }) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+  for (const auto* request : {
+           "put struct_vector[0].f32 nan",
+           "put struct_vector[0].f32 -inf",
+           "put struct_vector[0].ui64 18446744073709551615",
+           "put struct_vector[0].i64 -9223372036854775808",
+           "put marker_vector[0].on 1",
+           "put marker_vector[0].color 5",
+       }) {
+    EXPECT_TRUE(parses(request)) << request;
+  }
+}
+
+// A fixed-length array of structs is not written, at any depth; the members
+// beside one are, and so is an element that is created zeroed.
+TEST_F(StructVectorTest, WritesNoArrayOfStructsInsideAnElement) {
+  for (const auto* request : {
+           "put nested_vector[0].structs[0].a 1",
+           R"(put nested_vector[0].structs [{"a": 1}])",
+           R"(put nested_vector[0] {"structs": [{"a": 1}]})",
+           R"(put nested_vector [{"inner": {"a": 1, "arr": [1, 2, 3]}, )"
+           R"("structs": [{"a": 1, "arr": [1, 2, 3]}, {"a": 1, "arr": [1, 2, )"
+           R"(3]}], "tail": 1}])",
+           "put nested_vector [1]",
+       }) {
+    EXPECT_FALSE(parses(request)) << request;
+  }
+  auto result = applyRequestTo(
+      GetBuffer("{}"),
+      "patch { put nested_vector[1] {} ; put nested_vector[1].inner.a 3 ; "
+      R"(put nested_vector[0] {"tail": 7} })");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->nested_vector(), nullptr);
+  ASSERT_EQ(ts->nested_vector()->size(), 2U);
+  EXPECT_EQ(ts->nested_vector()->Get(0)->tail(), 7);
+  EXPECT_EQ(ts->nested_vector()->Get(1)->inner().a(), 3);
+  EXPECT_EQ(ts->nested_vector()->Get(1)->structs()->Get(1)->a(), 0);
+  EXPECT_TRUE(parses("put nested_vector []"));
+}
+
+TEST_F(StructVectorTest, PatchesAVectorOfStructs) {
+  const auto initial = holders(twoHolders());
+  expectEdit(initial, "patch holder_vector[1] { put tail 1 ; put inner.a 2 }",
+             holders(holder(1, {1, 2, 3}, 4) + ", " + holder(2, {6, 7, 8}, 1)));
+  expectEdit(initial, "patch holder_vector[0].inner { put arr[0] 0 }",
+             holders(holder(1, {0, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 9)));
+  expectEdit(
+      initial,
+      "patch { put holder_vector [" + zeroHolder()
+          + "] ; put holder_vector[1].tail 9 ; delete holder_vector[0] }",
+      holders(holder(0, {0, 0, 0}, 9)));
+  expectEdit(
+      "{}", "patch object { put holder_vector[0] {} ; put i8 1 }",
+      R"({"object": {"i8": 1, "holder_vector": [)" + zeroHolder() + "]}}");
+  // An empty patch is a copy, wherever it points.
+  expectEdit(initial, "patch holder_vector[3] { }", initial);
+  // All or nothing: a delete of something not stored writes no put either.
+  EXPECT_EQ(outcomeOf(GetBuffer(initial),
+                      "patch { put holder_vector[0].tail 1 ; "
+                      "delete holder_vector[5] }"),
+            ApplyOutcome::NotStored);
+}
+
+// A vector of structs is laid out at its struct's alignment from the start
+// of the buffer, wherever an edit rebuilds it and wherever a copy places it:
+// 16 bytes for a struct forced there, 8 for one holding a 64-bit member.
+TEST_F(StructVectorTest, KeepsAVectorAtItsStructsAlignment) {
+  const auto initial = GetBuffer(
+      R"({"i8": 1, "string": "abc", "aligned_vector": [{"x": 1, "y": 2}, )"
+      R"({"x": 5, "y": 6}], "struct_vector": [)"
+      + std::string{kStructA} + ", " + kStructB + "]}");
+  for (const auto* request : {
+           "put aligned_vector[0].y 5",
+           "put aligned_vector[2] {}",
+           R"(put aligned_vector [{"x": 1, "y": 2}, {"x": 3, "y": 4}])",
+           "delete aligned_vector[0]",
+           "put struct_vector[1].i8 3",
+           "put struct_vector[0] {}",
+           "delete struct_vector[0]",
+           "put string \"abcde\"",
+           "patch { put i16 2 ; put aligned_vector[1].x 3 }",
+       }) {
+    const auto result = applyRequestTo(initial, request);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    const auto offsetOf = [&](const void* data) {
+      return static_cast<const uint8_t*>(data) - result.data();
+    };
+    ASSERT_NE(ts->aligned_vector(), nullptr) << request;
+    EXPECT_EQ(offsetOf(ts->aligned_vector()->Data()) % 16, 0) << request;
+    ASSERT_NE(ts->struct_vector(), nullptr) << request;
+    EXPECT_EQ(offsetOf(ts->struct_vector()->Data()) % 8, 0) << request;
+  }
+  const auto result =
+      applyRequestTo(initial, R"(put aligned_vector[2] {"x": 7})");
+  const auto* aligned =
+      matcher_test::GetTestSchema(result.data())->aligned_vector();
+  ASSERT_EQ(aligned->size(), 3U);
+  EXPECT_EQ(aligned->Get(0)->x(), 1);
+  EXPECT_EQ(aligned->Get(1)->y(), 6);
+  EXPECT_EQ(aligned->Get(2)->x(), 7);
+  EXPECT_EQ(aligned->Get(2)->y(), 0);
+}
+
+// The members at the edges of what each kind holds, and the floats that are
+// not finite, written by element and whole.
+TEST_F(StructVectorTest, WritesTheEdgeValuesOfEveryMemberKind) {
+  auto result = applyRequestTo(
+      GetBuffer("{}"),
+      "patch { put wide_vector [{\"ui64_array\": [18446744073709551615, "
+      "9223372036854775808], \"b_array\": [true, 0], \"f32_array\": [inf, "
+      "-inf]}] ; put wide_vector[1].f32_array[0] nan ; "
+      "put wide_vector[1].f32_array[1] 3.4028235e38 ; "
+      "put struct_vector[0] {\"i64\": -9223372036854775808, \"i8\": -128, "
+      "\"ui8\": 255, \"f64\": -infinity} }");
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->wide_vector(), nullptr);
+  ASSERT_EQ(ts->wide_vector()->size(), 2U);
+  const auto* first = ts->wide_vector()->Get(0);
+  EXPECT_EQ(first->ui64_array()->Get(0), uint64_t{18446744073709551615U});
+  EXPECT_EQ(first->ui64_array()->Get(1), uint64_t{1} << 63U);
+  EXPECT_TRUE(first->b_array()->Get(0));
+  EXPECT_FALSE(first->b_array()->Get(1));
+  EXPECT_TRUE(std::isinf(first->f32_array()->Get(0)));
+  EXPECT_GT(first->f32_array()->Get(0), 0.0F);
+  EXPECT_TRUE(std::isinf(first->f32_array()->Get(1)));
+  EXPECT_LT(first->f32_array()->Get(1), 0.0F);
+  const auto* second = ts->wide_vector()->Get(1);
+  EXPECT_TRUE(std::isnan(second->f32_array()->Get(0)));
+  EXPECT_EQ(second->f32_array()->Get(1), std::numeric_limits<float>::max());
+  ASSERT_NE(ts->struct_vector(), nullptr);
+  const auto* scalars = ts->struct_vector()->Get(0);
+  EXPECT_EQ(scalars->i64(), std::numeric_limits<int64_t>::min());
+  EXPECT_EQ(scalars->i8(), -128);
+  EXPECT_EQ(scalars->ui8(), 255);
+  EXPECT_TRUE(std::isinf(scalars->f64()));
+  EXPECT_LT(scalars->f64(), 0.0);
+}
+
+namespace {
+/// The struct `structDef` at `bytes` as a map naming every member, each value
+/// spelled so that the value reader reads back the bits stored: an integer
+/// in full, a float to the digits that round-trip it, `inf` and `nan`.
+std::string structText(const reflection::Schema* schema,
+                       const reflection::Object* structDef,
+                       const uint8_t* bytes) {
+  const auto scalarText = [](reflection::BaseType type, const uint8_t* at) {
+    const auto read = [at](auto value) {
+      std::memcpy(&value, at, sizeof(value));
+      return value;
+    };
+    auto text = std::array<char, 64>{};
+    switch (type) {
+      case reflection::Bool:
+        return std::string{read(uint8_t{}) != 0 ? "true" : "false"};
+      case reflection::Byte:
+        return std::to_string(read(int8_t{}));
+      case reflection::UByte:
+        return std::to_string(read(uint8_t{}));
+      case reflection::Short:
+        return std::to_string(read(int16_t{}));
+      case reflection::UShort:
+        return std::to_string(read(uint16_t{}));
+      case reflection::Int:
+        return std::to_string(read(int32_t{}));
+      case reflection::UInt:
+        return std::to_string(read(uint32_t{}));
+      case reflection::Long:
+        return std::to_string(read(int64_t{}));
+      case reflection::ULong:
+        return std::to_string(read(uint64_t{}));
+      case reflection::Float:
+        std::snprintf(text.data(), text.size(), "%.9g",
+                      static_cast<double>(read(float{})));
+        return std::string{text.data()};
+      default:
+        std::snprintf(text.data(), text.size(), "%.17g", read(double{}));
+        return std::string{text.data()};
+    }
+  };
+  auto text = std::string{"{"};
+  for (const auto* member : *structDef->fields()) {
+    text += (text.size() > 1 ? ", \"" : "\"") + member->name()->str() + "\": ";
+    const auto* type = member->type();
+    const auto* at = bytes + member->offset();
+    if (type->base_type() == reflection::Obj) {
+      text += structText(schema, schema->objects()->Get(type->index()), at);
+    } else if (type->base_type() == reflection::Array) {
+      text += "[";
+      const auto size = flatbuffers::GetTypeSize(type->element());
+      for (uint16_t i = 0; i < type->fixed_length(); i++) {
+        text +=
+            (i == 0 ? "" : ", ") + scalarText(type->element(), at + (i * size));
+      }
+      text += "]";
+    } else {
+      text += scalarText(type->base_type(), at);
+    }
+  }
+  return text + "}";
+}
+}  // namespace
+
+// What a vector of structs stores, spelled back element by element, puts the
+// same bytes into another buffer: every kind of member at the edges of its
+// range, floats that are not finite, and a float that is not exact.
+TEST_F(StructVectorTest, PutsBackWhatAVectorStores) {
+  const auto source = applyRequestTo(
+      GetBuffer("{}"),
+      "patch { put holder_vector[1].inner.a -128 ; "
+      "put holder_vector[0].inner.arr[2] -32768 ; "
+      "put holder_vector[1].tail 2147483647 ; "
+      "put marker_vector[0] {\"on\": true, \"color\": 5} ; "
+      "put marker_vector[1] {} ; "
+      "put wide_vector[0].ui64_array[0] 18446744073709551615 ; "
+      "put wide_vector[0].ui64_array[1] 9223372036854775808 ; "
+      "put wide_vector[0].f32_array[0] 0.1 ; "
+      "put wide_vector[1].f32_array[0] -inf ; "
+      "put wide_vector[1].f32_array[1] nan ; "
+      "put struct_vector[0] {\"i64\": -9223372036854775808, \"f64\": 0.1, "
+      "\"f32\": 3.4028235e38, \"ui32\": 4294967295, \"b\": true} ; "
+      "put struct_vector[1].i32_array[3] -1 }");
+  const auto* rootDef = schema_->root_table();
+  for (const auto* name :
+       {"holder_vector", "marker_vector", "wide_vector", "struct_vector"}) {
+    const auto* fieldDef = rootDef->fields()->LookupByKey(name);
+    const auto* structDef = schema_->objects()->Get(fieldDef->type()->index());
+    const auto* stored =
+        flatbuffers::GetAnyRoot(source.data())
+            ->GetPointer<const flatbuffers::VectorOfAny*>(fieldDef->offset());
+    ASSERT_NE(stored, nullptr) << name;
+    auto request = std::string{"put "} + name + " [";
+    for (flatbuffers::uoffset_t i = 0; i < stored->size(); i++) {
+      request += (i == 0 ? "" : ", ")
+                 + structText(schema_, structDef,
+                              stored->Data() + (i * structDef->bytesize()));
+    }
+    request += "]";
+    const auto result =
+        applyRequestTo(GetBuffer(holders(twoHolders())), request);
+    const auto* written =
+        flatbuffers::GetAnyRoot(result.data())
+            ->GetPointer<const flatbuffers::VectorOfAny*>(fieldDef->offset());
+    ASSERT_NE(written, nullptr) << request;
+    ASSERT_EQ(written->size(), stored->size()) << request;
+    EXPECT_EQ(std::memcmp(written->Data(), stored->Data(),
+                          stored->size() * structDef->bytesize()),
+              0)
+        << request;
+  }
+}
+
+// Every other field of the buffer, of every kind, is copied as it was beside
+// an edit of a vector of structs.
+TEST_F(StructVectorTest, KeepsEveryOtherFieldAsItWas) {
+  const auto withHolders = [](const std::string& elements) {
+    return R"({"b": true, "i8": -3, "ui64": 18446744073709551615, )"
+           R"("f64": 0.1, "string": "kept", "object": {"i8": 2, )"
+           R"("struct_vector": [)"
+           + std::string{kStructB}
+           + R"(]}, "number_type": "Fraction", "number": {"numerator": 1, )"
+             R"("denominator": 2}, "scalars": )"
+           + kStructB
+           + R"(, "ui64_vector": [18446744073709551615, 1], )"
+             R"("string_vector": ["a", "b"], "object_vector": [{"i16": 1}], )"
+             R"("number_vector_type": ["Integer", "FloatingPoint"], )"
+             R"("number_vector": [{"value": 1}, {"value": 1.5}], )"
+             R"("struct_vector": [)"
+           + kStructA + ", " + kStructB
+           + R"(], "color": "Blue", "color_vector": ["Green", "Red"], )"
+             R"("nested": {"inner": {"a": 1, "arr": [1, 2, 3]}, "structs": [)"
+             R"({"a": 4, "arr": [5, 6, 7]}, {"a": 8, "arr": [9, 10, 11]}], )"
+             R"("tail": 12}, "sparse_type": "Integer", "sparse": {"value": 4}, )"
+             R"("wide": {"ui64_array": [18446744073709551615, 2], )"
+             R"("b_array": [true, false], "f32_array": [0.5, -0.5]}, )"
+             R"("aligned_vector": [{"x": 1, "y": 2}], "holder_vector": [)"
+           + elements + "]}";
+  };
+  const auto initial = withHolders(twoHolders());
+  expectEdit(
+      initial, "put holder_vector[1].tail 0",
+      withHolders(holder(1, {1, 2, 3}, 4) + ", " + holder(5, {6, 7, 8}, 0)));
+  expectEdit(initial, "put holder_vector[2] {}",
+             withHolders(twoHolders() + ", " + zeroHolder()));
+  expectEdit(initial, "delete holder_vector[0]",
+             withHolders(holder(5, {6, 7, 8}, 9)));
+  expectEdit(initial, "put holder_vector [" + zeroHolder() + "]",
+             withHolders(zeroHolder()));
+  expectEdit(
+      initial, "patch { put holder_vector[0].tail 0 ; put i8 -3 }",
+      withHolders(holder(1, {1, 2, 3}, 0) + ", " + holder(5, {6, 7, 8}, 9)));
+}
+
+// A put grows a vector of structs only as far as a flatbuffer holds, which
+// for a struct is its size per element: a narrow struct reaches further than
+// a wide one.
+TEST_F(StructVectorTest, GrowsAVectorOfStructsOnlyAsFarAsAFlatbufferHolds) {
+  EXPECT_FALSE(parses("put struct_vector[20000000] {}"));
+  EXPECT_FALSE(parses("put struct_vector[20000000].i8 1"));
+  EXPECT_TRUE(parses("put marker_vector[200000000] {}"));
+  EXPECT_FALSE(parses("put marker_vector[600000000] {}"));
+}
+
+// A whole-vector payload whose elements are each an offset to one shared
+// map is a few kilobytes that would build a vector larger than a flatbuffer
+// holds, which the count of its elements bounds.
+TEST_F(HandBuiltTest, RefusesAWholeStructVectorPastWhatAFlatbufferHolds) {
+  constexpr auto kValues = 8192;
+  const auto payload = [](int elements) {
+    flexbuffers::Builder builder;
+    const auto list = builder.StartVector();
+    const auto map = builder.StartMap();
+    const auto values = builder.StartVector("values");
+    for (auto i = 0; i < kValues; i++) {
+      builder.Double(0.5);
+    }
+    builder.EndVector(values, false, false);
+    builder.EndMap(map);
+    const auto shared = builder.LastValue();
+    for (auto i = 1; i < elements; i++) {
+      builder.ReuseValue(shared);
+    }
+    builder.EndVector(list, false, false);
+    builder.Finish();
+    return builder.GetBuffer();
+  };
+  const auto initial = GetBuffer("{}");
+  const auto bigVector = fieldOffset("big_vector");
+  EXPECT_EQ(putOutcome(initial, {bigVector}, payload(16384)),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {bigVector}, payload(2)),
+            ApplyOutcome::Applied);
+}
+
+// A patch whose offsets stop at an element of a vector of structs, holding
+// puts whose offsets name members of it, writes them into that element.
+TEST_F(HandBuiltTest, PatchesAnElementOfAVectorOfStructs) {
+  const auto initial =
+      GetBuffer(R"({"marker_vector": [{"on": true, "color": "Red"}]})");
+  const auto* markerDef =
+      schema_->objects()->LookupByKey("matcher_test.Marker");
+  const auto color = markerDef->fields()->LookupByKey("color")->offset();
+  const auto patchOutcome = [&](uint32_t index, uint32_t member) {
+    flatbuffers::FlatBufferBuilder requestBuilder;
+    const auto put = serialized::CreatePut(
+        requestBuilder, requestBuilder.CreateVector(std::vector{member}),
+        requestBuilder.CreateVector(flexPayload("5")));
+    const auto patch = serialized::CreatePatch(
+        requestBuilder,
+        requestBuilder.CreateVector(
+            std::vector<uint32_t>{fieldOffset("marker_vector"), index}),
+        requestBuilder.CreateVector(std::vector{serialized::Operation::Put}),
+        requestBuilder.CreateVector(std::vector{put.Union()}));
+    requestBuilder.Finish(serialized::CreateRequest(
+        requestBuilder, serialized::Operation::Patch, patch.Union()));
+    return outcomeOfRequest(initial, requestBuilder.GetBufferPointer());
+  };
+  EXPECT_EQ(patchOutcome(0, color), ApplyOutcome::Applied);
+  EXPECT_EQ(patchOutcome(1, color), ApplyOutcome::Applied);
+  EXPECT_EQ(patchOutcome(0, 7), ApplyOutcome::Refused);
+}
+
+TEST_F(HandBuiltTest, RefusesAStructVectorPayloadItCannotWrite) {
+  const auto initial =
+      GetBuffer(R"({"marker_vector": [{"on": true, "color": "Red"}]})");
+  const auto markers = fieldOffset("marker_vector");
+  const auto* markerDef =
+      schema_->objects()->LookupByKey("matcher_test.Marker");
+  const auto on = markerDef->fields()->LookupByKey("on")->offset();
+  for (const auto* json : {"5", "{}", "[1]", R"([{"on": true}])",
+                           R"([{"on": true, "color": 0}, 7])",
+                           R"([{"on": true, "color": 0, "zzz": 1}])",
+                           R"([{"on": true, "color": 256}])"}) {
+    EXPECT_EQ(putOutcome(initial, {markers}, flexPayload(json)),
+              ApplyOutcome::Refused)
+        << json;
+  }
+  for (const auto* json : {"5", "[]", R"({"zzz": 1})", R"({"on": 2})"}) {
+    EXPECT_EQ(putOutcome(initial, {markers, 0}, flexPayload(json)),
+              ApplyOutcome::Refused)
+        << json;
+  }
+  // A member the struct does not declare, a path past a scalar member, and a
+  // value that is not what the member holds.
+  EXPECT_EQ(putOutcome(initial, {markers, 0, 7}, flexPayload("1")),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {markers, 0, on, 0}, flexPayload("1")),
+            ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {markers, 0, on}, flexPayload("[1]")),
+            ApplyOutcome::Refused);
+  // An element past what a flatbuffer holds.
+  EXPECT_EQ(putOutcome(initial, {markers, 1U << 30U}, flexPayload("{}")),
+            ApplyOutcome::Refused);
+  // An element of an array of structs inside an element.
+  const auto* nestedDef =
+      schema_->objects()->LookupByKey("matcher_test.Nested");
+  const auto structs = nestedDef->fields()->LookupByKey("structs")->offset();
+  EXPECT_EQ(
+      putOutcome(initial, {fieldOffset("nested_vector"), 0, structs, 0, 0},
+                 flexPayload("1")),
+      ApplyOutcome::Refused);
+  EXPECT_EQ(putOutcome(initial, {markers},
+                       flexPayload(R"([{"on": true, "color": 4}])")),
+            ApplyOutcome::Applied);
+  EXPECT_EQ(putOutcome(initial, {markers, 0, on}, flexPayload("false")),
+            ApplyOutcome::Applied);
+  EXPECT_EQ(putOutcome(initial, {markers, 3}, flexPayload("{}")),
             ApplyOutcome::Applied);
 }

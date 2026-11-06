@@ -18,6 +18,8 @@ namespace matcher_test;
 
 table Integer {
   value: int32;
+  // Appended: a vector of structs reached through a union member.
+  inner_vector: [Inner];
 }
 
 table FloatingPoint {
@@ -94,6 +96,33 @@ struct Wide {
   f32_array: [float32:2];
 }
 
+// A struct holding a struct and a member after it, which a put into an
+// element of a vector of them reaches at their own offsets.
+struct Holder {
+  inner: Inner;
+  tail: int32;
+}
+
+// A bool and an enum, which an element of a vector of these takes as
+// `true`, `false`, 0 or 1, and as the enum's ordinal.
+struct Marker {
+  on: bool;
+  color: Color;
+}
+
+// Aligned past what its members ask, so a vector of these is laid out at 16
+// bytes from the buffer's start whatever else the buffer holds.
+struct Aligned (force_align: 16) {
+  x: int32;
+  y: int8;
+}
+
+// 64 KiB, so that a vector of these reaches what a flatbuffer holds at an
+// element count a test can name.
+struct Big {
+  values: [float64:8192];
+}
+
 table TestSchema {
   b: bool;
   i8: int8;
@@ -138,6 +167,13 @@ table TestSchema {
   sparse: Sparse;
   sparse_vector: [Sparse];
   wide: Wide;
+  // Vectors of structs each element of which a put writes in place.
+  holder_vector: [Holder];
+  marker_vector: [Marker];
+  wide_vector: [Wide];
+  nested_vector: [Nested];
+  aligned_vector: [Aligned];
+  big_vector: [Big];
 }
 
 root_type TestSchema;

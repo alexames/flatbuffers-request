@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "ElementIndex.hpp"
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/util.h"
 
@@ -532,6 +533,87 @@ bool writeStructMap(const reflection::Schema* schema,
   return true;
 }
 
+// The body of writeStructVectorPayload, which see; recursive for a nested
+// struct.
+bool writeWholeStruct(const reflection::Schema* schema,
+                      const reflection::Object* structDef,
+                      std::span<uint8_t> image, flexbuffers::Reference value) {
+  if (not value.IsMap()) {
+    return false;
+  }
+  const auto map = value.AsMap();
+  const auto keys = map.Keys();
+  const auto values = map.Values();
+  const auto* fields = structDef->fields();
+  if (keys.size() != fields->size()) {
+    return false;
+  }
+  // Each member of a struct is at an offset of its own, so a key named twice
+  // is caught by its member's offset.
+  auto named = std::vector<uint16_t>{};
+  for (size_t i = 0; i < keys.size(); i++) {
+    const auto* fieldDef = fields->LookupByKey(keys[i].AsKey());
+    if (fieldDef == nullptr or fieldDef->offset() >= image.size()
+        or std::ranges::find(named, fieldDef->offset()) != named.end()) {
+      return false;
+    }
+    named.push_back(fieldDef->offset());
+    const auto at = image.subspan(fieldDef->offset());
+    const auto* type = fieldDef->type();
+    const auto member = values[i];
+    if (type->base_type() == reflection::Obj) {
+      const auto* nested = schema->objects()->Get(type->index());
+      if (not writeWholeStruct(schema, nested, at.first(nested->bytesize()),
+                               member)) {
+        return false;
+      }
+      continue;
+    }
+    if (type->base_type() == reflection::Array) {
+      const auto elementType = type->element();
+      const auto length = size_t{type->fixed_length()};
+      // An array of structs is refused here as writeStructPayload refuses
+      // one: no element of one is written.
+      if (not IsScalar(elementType)
+          or not scalarListFits(member, elementType, length)
+          or member.AsVector().size() != length) {
+        return false;
+      }
+      const auto elements = member.AsVector();
+      const auto elementSize = GetTypeSize(elementType);
+      for (size_t j = 0; j < length; j++) {
+        writeScalar(elements[j], elementType, at.subspan(j * elementSize));
+      }
+      continue;
+    }
+    if (not scalarFits(member, type->base_type())) {
+      return false;
+    }
+    writeScalar(member, type->base_type(), at);
+  }
+  return true;
+}
+
+// Whether `value` is a list of elements of a vector of `structDef`, each a
+// map naming every member of the struct (see writeWholeStruct), and no more
+// of them than a flatbuffer holds.
+bool structListFits(const reflection::Schema* schema,
+                    const reflection::Object* structDef,
+                    flexbuffers::Reference value) {
+  if (not isList(value)
+      or not structVectorCanHold(structDef, value.AsVector().size())) {
+    return false;
+  }
+  const auto elements = value.AsVector();
+  auto image = std::vector<uint8_t>(structDef->bytesize());
+  for (size_t i = 0; i < elements.size(); i++) {
+    if (not writeWholeStruct(schema, structDef, image, elements[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 bool scalarFits(flexbuffers::Reference value, reflection::BaseType type) {
@@ -675,6 +757,24 @@ bool writeStructPayload(const reflection::Schema* schema,
   return true;
 }
 
+bool writeStructElementPayload(const reflection::Schema* schema,
+                               const reflection::Object* structDef,
+                               std::span<uint8_t> image,
+                               std::span<const uint32_t> path,
+                               flexbuffers::Reference value) {
+  if (path.empty() and value.IsMap() and value.AsMap().size() == 0) {
+    return true;
+  }
+  return writeStructPayload(schema, structDef, image, path, value);
+}
+
+bool writeStructVectorPayload(const reflection::Schema* schema,
+                              const reflection::Object* structDef,
+                              std::span<uint8_t> image,
+                              flexbuffers::Reference value) {
+  return writeWholeStruct(schema, structDef, image, value);
+}
+
 bool payloadFits(const reflection::Schema* schema, const reflection::Type* type,
                  bool element, flexbuffers::Reference value) {
   const auto baseType = element ? type->element() : type->base_type();
@@ -687,10 +787,17 @@ bool payloadFits(const reflection::Schema* schema, const reflection::Type* type,
         return false;
       }
       auto image = std::vector<uint8_t>(objectDef->bytesize());
-      return writeStructPayload(schema, objectDef, image, {}, value);
+      return element ? writeStructElementPayload(schema, objectDef, image, {},
+                                                 value)
+                     : writeStructPayload(schema, objectDef, image, {}, value);
     }
     case reflection::Vector: {
       const auto elementType = type->element();
+      if (elementType == reflection::Obj) {
+        const auto* elementDef = schema->objects()->Get(type->index());
+        return elementDef->is_struct()
+               and structListFits(schema, elementDef, value);
+      }
       if (IsScalar(elementType)) {
         // A whole vector may be empty, which an array may not.
         return isList(value)

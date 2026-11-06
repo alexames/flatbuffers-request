@@ -19,6 +19,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   debug build on a `vector64`, and looks a union member up by its position
   among the union's values rather than its value. The `fbrequest` tool
   verifies its input with it.
+- Puts and patches on a vector of structs, which were refused. Each rebuilds
+  the vector at its struct's alignment, or what `force_align` asks, and
+  copies the rest of the table as any edit does:
+  - `put struct_vector[1].i8 5` writes one member of an element, through
+    nested structs and into one element of a fixed-length array in one
+    (`put holder_vector[1].inner.arr[2] 7`). A nested struct or an array in
+    the element takes a map or a list, as a struct field's does.
+  - `put struct_vector[1] {"i8": 5}` writes the members a map names and
+    keeps the rest of the stored element, as a struct field's put does. An
+    empty map names the element alone: `put struct_vector[n] {}`, with `n`
+    the vector's length, appends a zeroed element, and starts a vector the
+    buffer does not store.
+  - An index past the end grows the vector to reach it, as every other
+    vector grows, the elements between zeroed. A vector grows, and a whole
+    put builds one, only as far as its struct's size per element lets it fit
+    in a flatbuffer.
+  - `put struct_vector [{...}, ...]` replaces every element, starting the
+    vector where it is not stored. Each element names every member of its
+    struct exactly once: a nested struct by a map of the same form, and a
+    fixed-length array of scalars by a list of exactly its length. A member
+    missing, undeclared or named twice is refused, since there is no stored
+    element for it to keep. `[]` stores the vector empty.
+  - `patch struct_vector[1] { put i8 5 ; put i16 6 }` patches an element.
+  - A struct holding a fixed-length array of structs is written around it:
+    no element of that array is written, so a whole put of a vector of such
+    structs takes only `[]`.
+
+  Values are checked as every other value is (see `docs/grammar.md`). A
+  delete of an element (`delete struct_vector[1]`) was already served, and
+  a delete inside one is still refused.
 
 ### Changed
 - A request that would copy, unedited, a union payload stored under NONE or
@@ -122,8 +152,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the buffer holds another member, are now a no-op, as a delete of a field of
   such a member already was. They removed the member the buffer did hold.
 - A `patch` takes only a path a `put` could, since its operations may be
-  puts: one into a vector or array of structs, or naming no member of a union,
-  is refused even when it holds only deletes.
+  puts: one stopping at a whole vector, into an array of structs, or naming
+  no member of a union, is refused even when it holds only deletes.
 - A hand-built `put` of a union-vector element naming a member that holds no
   table (`NONE`, or an undeclared value) leaves the vector as stored, as it
   does for a single union. It wrote an empty element.
@@ -206,8 +236,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as a delete inside a struct field is.
 - A `patch` whose path is a vector or array of structs, or an element of one
   (`patch struct_vector { put i8 1 }`), parsed, and its puts read the patched
-  field's offset as an element index or built nothing. It is refused, as a
-  `put` there is.
+  field's offset as an element index or built nothing. One stopping at a
+  whole vector, or at an element of an array of structs, is refused; one
+  naming an element of a vector of structs patches it (see `### Added`).
 - A union member that is a struct (possible in a schema generated for C++
   alone) was read as a table: a path into one, and a stored one copied
   because the request edited something else, read its bytes as a vtable. A

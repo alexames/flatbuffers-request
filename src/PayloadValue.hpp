@@ -54,8 +54,37 @@ bool writeStructPayload(const reflection::Schema* schema,
                         std::span<const uint32_t> path,
                         flexbuffers::Reference value);
 
+// Writes `value` into `image`, the bytes of an element of a vector of
+// `structDef`, at the member `path` names, as writeStructPayload writes a
+// struct, except that an empty map with an empty `path` is taken and writes
+// nothing: it names the element alone, which a put creates zeroed where the
+// vector does not reach it. writeStructPayload refuses an empty map, since a
+// struct field's put of one would make no edit. Answers false where
+// writeStructPayload does, with `image` then partly written.
+bool writeStructElementPayload(const reflection::Schema* schema,
+                               const reflection::Object* structDef,
+                               std::span<uint8_t> image,
+                               std::span<const uint32_t> path,
+                               flexbuffers::Reference value);
+
+// Writes `value`, one element of a whole-vector payload for a vector of
+// `structDef`, into `image`, the element's bytes. `value` is a map naming
+// every member of the struct exactly once: a nested struct by a map of the
+// same form, a fixed-length array of scalars by a list of exactly its length,
+// a scalar by a value it holds (see scalarFits). Answers false, with `image`
+// partly written, for any other value: a member missing, undeclared or named
+// twice, an array of another length, or a member that is an array of
+// structs, which no value writes.
+bool writeStructVectorPayload(const reflection::Schema* schema,
+                              const reflection::Object* structDef,
+                              std::span<uint8_t> image,
+                              flexbuffers::Reference value);
+
 // Whether `value` is a flexbuffer payload a put writes into a value of `type`:
 // the field or member whole, or with `element`, one element of the vector or
-// array it is. A table is not a flexbuffer payload, so it answers false.
+// array it is. A table is not a flexbuffer payload, so it answers false. A
+// whole vector of structs takes a list of what writeStructVectorPayload
+// takes, no longer than a flatbuffer holds, and one element of one what
+// writeStructElementPayload takes with an empty path.
 bool payloadFits(const reflection::Schema* schema, const reflection::Type* type,
                  bool element, flexbuffers::Reference value);

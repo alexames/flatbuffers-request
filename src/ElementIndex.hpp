@@ -19,9 +19,27 @@ inline constexpr uint64_t kMostBytesPerPaddedOffsetElement = 16;
 inline constexpr uint64_t kLargestGrownVectorBytes =
     FLATBUFFERS_MAX_BUFFER_SIZE / 2;
 
-// Whether a put can grow a vector of `elementType` to hold an element at
-// `index`, with `bytesBuilt` bytes already in the builder it is built into.
-// Past this the builder would overrun the most a flatbuffer can hold.
+// Whether a put can build a vector of `count` elements of the struct
+// `structDef`, which are inline at its size, with `bytesBuilt` bytes already
+// in the builder it is built into. A whole-vector payload is no bound on its
+// own: each of its elements may be an offset to one shared map.
+inline bool structVectorCanHold(const reflection::Object* structDef,
+                                uint64_t count, uint64_t bytesBuilt = 0) {
+  return count * static_cast<uint64_t>(structDef->bytesize()) + bytesBuilt
+         <= kLargestGrownVectorBytes;
+}
+
+// Whether a put can grow a vector of the struct `structDef` to hold an
+// element at `index` (see structVectorCanHold).
+inline bool structVectorCanGrowTo(const reflection::Object* structDef,
+                                  uint64_t index, uint64_t bytesBuilt = 0) {
+  return structVectorCanHold(structDef, index + 1, bytesBuilt);
+}
+
+// Whether a put can grow a vector of `elementType`, which is not a struct, to
+// hold an element at `index`, with `bytesBuilt` bytes already in the builder
+// it is built into. Past this the builder would overrun the most a flatbuffer
+// can hold.
 inline bool vectorCanGrowTo(reflection::BaseType elementType, uint64_t index,
                             uint64_t bytesBuilt = 0) {
   const auto bytesPerElement =
