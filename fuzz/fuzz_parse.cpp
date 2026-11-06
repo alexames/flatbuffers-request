@@ -115,8 +115,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // every request the parser writes must pass it.
     auto verifier = flatbuffers::Verifier(parsed->data(), parsed->size());
     if (not serialized::VerifyRequestBuffer(verifier)) {
-      std::fprintf(stderr, "a parsed request does not pass the verifier
-");
+      std::fputs("a parsed request does not pass the verifier\n", stderr);
       std::abort();
     }
     const auto* root =
