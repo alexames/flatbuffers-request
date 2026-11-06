@@ -1013,16 +1013,28 @@ TEST_F(HandBuiltTest, RefusesAPutOfAUnionMemberThatHoldsNoTable) {
   }
 }
 
-TEST_F(HandBuiltTest, CopiesAStoredUnionWithNoTableToReadItAs) {
+// A payload stored under NONE, or under a member the union does not declare,
+// has no layout the schema gives, so no copy of it can come out as it went
+// in. A request that would copy one is refused; one that replaces or removes
+// the union never reads it.
+TEST_F(HandBuiltTest, RefusesToCopyAStoredUnionWithNoTableToReadItAs) {
   for (const auto member : {kNone, kUndeclared}) {
     const auto initial = withUnion(member);
-    for (const auto* request : {"put i8 5", "delete i16"}) {
-      auto result = applyRequestTo(initial, request);
-      const auto* ts = matcher_test::GetTestSchema(result.data());
-      EXPECT_EQ(static_cast<uint8_t>(ts->number_type()), member) << request;
-      EXPECT_NE(ts->number(), nullptr) << request;
-      expectSiblingsKept(ts);
+    for (const auto* request :
+         {"put i8 5", "delete i16", "patch { put i8 5 }", "patch {}"}) {
+      EXPECT_EQ(outcomeOf(initial, request), ApplyOutcome::Refused) << request;
     }
+    auto result = applyRequestTo(initial, "delete number");
+    const auto* cleared = matcher_test::GetTestSchema(result.data());
+    EXPECT_EQ(cleared->number_type(), matcher_test::Number::NONE);
+    EXPECT_EQ(cleared->number(), nullptr);
+    expectSiblingsKept(cleared);
+
+    result = applyRequestTo(initial, "put number.Fraction.numerator 4");
+    const auto* switched = matcher_test::GetTestSchema(result.data());
+    ASSERT_NE(switched->number_as_Fraction(), nullptr);
+    EXPECT_EQ(switched->number_as_Fraction()->numerator(), 4);
+    expectSiblingsKept(switched);
   }
 }
 

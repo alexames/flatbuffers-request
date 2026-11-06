@@ -13,8 +13,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request). Nothing is built into the caller's builder for an outcome other
   than `Applied`. A patch is all or nothing: it answers `Refused` where any of
   its operations is refused, otherwise `NotStored` where any is.
+- `verifyBuffer`, which verifies a buffer against a schema reading each field
+  as its type declares it, where FlatBuffers' reflection `Verify` reads a
+  string or vector held through a 64-bit offset through 32 bits, asserts in a
+  debug build on a `vector64`, and looks a union member up by its position
+  among the union's values rather than its value. The `fbrequest` tool
+  verifies its input with it.
 
 ### Changed
+- A request that would copy, unedited, a union payload stored under NONE or
+  under a member its union does not declare is `Refused`: the schema gives
+  no layout to copy it by, and it was written as an empty table. So is one
+  that would copy a vector of unions whose discriminants do not pair one to
+  one with its elements, which was truncated to the shorter; one that would
+  copy a discriminant stored without its union, which was dropped; and one
+  that would copy a field the schema does not declare, which was dropped. A
+  request that
+  removes such a union or element, or switches the union to another member,
+  does not copy it and is still applied. A put whose value holds one at any
+  depth is refused too.
 - `applyRequest` returns a null offset, and builds nothing, for a request that
   does not make the edit it names. It returned a rebuilt copy of the source,
   indistinguishable from a request that was applied. A caller passing its
@@ -49,6 +66,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   string holding a control character or text that is not UTF-8.
 
 ### Fixed
+- What a request does not edit was copied wrongly, or the copy faulted, for
+  several kinds of field. The apply copied with FlatBuffers' `CopyTable`,
+  which reads every union member as a table, copies a vector of unions as
+  offsets into the source buffer, reads a string or vector held through a
+  64-bit offset (`offset64`, `vector64`) through 32 bits, lays out a vector
+  of structs at 4 bytes whatever the struct's alignment, and aligns no vector
+  to what its `force_align`, `nested_flatbuffer` or `flexbuffer` attribute
+  asks. The apply now copies with its own reflection-driven copy, which reads
+  each field as its type declares it: a union member by its discriminant's
+  value, as a table, a struct or a string, in a field and in a vector of
+  unions; a 64-bit offset through 64 bits, written back through one; a vector
+  of structs at the struct's alignment; and a vector at the alignment its
+  attributes ask, where the serialized schema carries them (`flatc
+  --bfbs-builtins`). This holds for the tables the request's path steps
+  through, for every table below them, and for a put's value. A put of a
+  table, or of a vector of tables, is verified the same way rather than with
+  FlatBuffers' reflection `Verify`, which refused a union member whose value
+  is not its position and asserted in a debug build on a `vector64`.
+- A put of a string or a 32-bit-length vector held through a 64-bit offset
+  (`put text64 "x"`, `put bytes64 [1, 2]`) wrote a 32-bit offset into the
+  field. It is written through a 64-bit offset. An element of such a vector,
+  and a `vector64` written whole or by element, are refused; a delete of the
+  whole field still removes it.
+- A put or delete whose source vector of scalars or of structs asks for an
+  alignment (`force_align`) rebuilt the vector at its element's alignment. It
+  keeps the alignment asked.
 - A value of the wrong kind for a scalar was written: `put i8 [5]` wrote the
   list's length, and a list or map given as a vector element or a struct
   member did the same. Each is refused, wherever the scalar is.

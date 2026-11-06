@@ -14,8 +14,9 @@
 2. **Apply** ([src/FlatbufferRequestApply.cpp](../src/FlatbufferRequestApply.cpp)) —
    walks the target reflection schema and rebuilds the buffer, copying every
    field that is unchanged and substituting the field named by the offset path.
-   It is a reflection-driven cousin of FlatBuffers' own `CopyTable`, with extra
-   logic to insert, overwrite, or omit the targeted field.
+   Everything the path does not reach is copied by the library's own
+   reflection-driven copy ([src/TableCopy.cpp](../src/TableCopy.cpp)); see
+   [Copying what a request does not edit](#copying-what-a-request-does-not-edit).
 
 Splitting parse from apply means a request can be serialized, logged, sent over
 a wire, or replayed — apply is a pure function of `(schema, source, request)`.
@@ -98,7 +99,7 @@ image.
 ## Coupling to FlatBuffers internals
 
 Apply and parse use FlatBuffers surface that is **not** part of its stable
-public API: the `Parser`, its `builder_` / `flex_builder_` members, `CopyTable`,
+public API: the `Parser`, its `builder_` / `flex_builder_` members,
 `GetFieldT` / `GetFieldI` / `GetFieldS`, `GetTypeSize`, `UnionTypeFieldSuffix`,
 and the `reflection::*` generated structs.
 
@@ -116,11 +117,60 @@ Consequences:
 Severing this coupling (depending only on the stable reflection API) is possible
 but a larger rework; it is intentionally deferred.
 
-Apply copies an unchanged sub-table with FlatBuffers' own `CopyTable`, which
-resolves a union through `GetUnionType` without checking that the stored
-discriminant names a table. A union stored with NONE or an undeclared
-discriminant is handled where apply copies it itself -- in the table a
-request edits -- but not inside a sub-table it hands to `CopyTable` whole.
+## Copying what a request does not edit
+
+A request rebuilds the tables its path steps through and copies every other
+field the buffer stores, and a put of a table copies its value into the
+buffer the same way. FlatBuffers' own `CopyTable` cannot do either faithfully:
+it reads every union member as a table (a struct, a string, NONE or an
+undeclared member included), copies a vector of unions as offsets into the
+buffer it copies from, reads a string or vector held through a 64-bit offset
+through 32 bits, lays out a vector of structs at 4 bytes whatever the struct's
+alignment, and aligns no vector past its element. So the library copies with
+its own reflection-driven copy, which reads each field as its type declares
+it:
+
+- a union member by its discriminant's VALUE, as the table, struct or string
+  it holds, in a union field and in each element of a vector of unions;
+- a string or vector held through a 64-bit offset through 64 bits, and a
+  `vector64`'s 64-bit length. The caller's builder is a 32-bit
+  `FlatBufferBuilder`, which has no separate 64-bit region, so the copied
+  object is placed where the copy reaches it and referred to through a 64-bit
+  offset, as FlatBuffers' own parser writes such a field into its 32-bit
+  builder. A buffer under 2 GiB reaches every object either way;
+- a vector of structs at the struct's alignment, and a vector at what its
+  `force_align`, `nested_flatbuffer` or `flexbuffer` attribute asks. These
+  attributes reach a serialized schema only when it is built with
+  `flatc --bfbs-builtins`; without them the schema does not say, and a
+  vector is aligned to its element. A nested flatbuffer is aligned to the
+  widest alignment the schema declares anywhere (a struct's, or a field's
+  `force_align`), since the alignment its buffer was built with is not
+  recorded.
+
+Some payloads have no layout the schema gives, so no copy of them can come
+out as it went in: a union payload stored under NONE or under a member its
+union does not declare (which a buffer written with a newer schema may hold),
+and a vector of unions whose discriminants do not pair one to one with its
+elements. Two more cannot be kept by a copy that rebuilds tables field by
+field from the schema: a discriminant stored without the union it names,
+which the builders write only beside its value, and a field at a vtable
+offset the schema does not declare. A request that would copy any of these
+is `Refused` before anything is built.
+One that does not copy it -- a delete of the union, the element or a table
+holding it, or a put switching the union to another member -- is applied.
+
+A put's table value is verified by the library's own verifier, which reads
+the same field kinds the copy does, rather than FlatBuffers' reflection
+`Verify`. That one reads a 64-bit offset through 32 bits, asserts in a debug
+build on a `vector64`, and looks a union member up by its position among the
+union's values. `verifyBuffer` offers the same verifier to a caller, and the
+`fbrequest` tool verifies its input with it.
+
+A put that names a field held through a 64-bit offset is written through one
+where the field's length is 32 bits (`offset64` strings and vectors, whole).
+An element of such a vector, and a `vector64` written whole or by element, are
+refused: the rebuilds of a vector read and write their elements through
+32-bit accessors.
 
 ## Layout
 

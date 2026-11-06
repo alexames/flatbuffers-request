@@ -163,8 +163,7 @@ int main(int argc, char** argv) {
   }
 
   // Verify the input against the schema before touching it.
-  if (!flatbuffers::Verify(*schema, *schema->root_table(), input->data(),
-                           input->size())) {
+  if (!fbrequest::verifyBuffer(schema, *input)) {
     std::cerr << "fbrequest: input is not a valid flatbuffer for the schema\n";
     return kRuntimeError;
   }
