@@ -114,6 +114,9 @@ if(FBREQUEST_BUILD_TESTS)
       INCLUDES
           PRIVATE
               "${CMAKE_CURRENT_SOURCE_DIR}/test/matchers"
+              # The library's internal entry points, which the tests reach
+              # past the public headers.
+              "${CMAKE_CURRENT_SOURCE_DIR}/src"
       DEPENDENCIES
           PRIVATE
               FlatbuffersRequest

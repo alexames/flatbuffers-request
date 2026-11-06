@@ -105,7 +105,9 @@ jobs:
             -DFBREQUEST_BUILD_TOOLS=OFF \
             -DFBREQUEST_BUILD_FUZZERS=ON \
             -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
-      - name: Build fuzzer
-        run: cmake --build build --target fbrequest_fuzz_parse
-      - name: Run fuzzer
+      - name: Build fuzzers
+        run: cmake --build build --target fbrequest_fuzz_parse fbrequest_fuzz_apply
+      - name: Run the parse fuzzer
         run: ./build/fuzz/fbrequest_fuzz_parse -max_total_time=30 -print_final_stats=1
+      - name: Run the apply fuzzer
+        run: ./build/fuzz/fbrequest_fuzz_apply -max_total_time=30 -print_final_stats=1

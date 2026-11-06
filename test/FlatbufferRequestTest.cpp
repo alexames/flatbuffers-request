@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <ranges>
@@ -11,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "RequestApply.hpp"
 #include "fbrequest/FlatbufferRequest.hpp"
 #include "fbrequest/FlatbufferRequest_generated.h"
 #include "flatbuffers/flatbuffers.h"
@@ -2998,4 +3000,584 @@ TEST_F(HandBuiltTest, RefusesAStructVectorPayloadItCannotWrite) {
             ApplyOutcome::Applied);
   EXPECT_EQ(putOutcome(initial, {markers, 3}, flexPayload("{}")),
             ApplyOutcome::Applied);
+}
+
+// A put grows a vector only as far as the bytes the caller's builder holds on
+// entry leave room for, and grows every vector it is classified Applied for,
+// whatever the apply builds into the builder before it reaches the vector.
+// The bound is a gigabyte, so these name a small one in its place, which the
+// classify pass alone checks: a builder that checked a bound of its own again,
+// against what it had built so far, would leave a vector these name as
+// stored.
+class GrowthBoundTest : public HandBuiltTest {
+ protected:
+  // The bytes the bound leaves a grown vector in each test.
+  static constexpr uint64_t kBudget = 4096;
+
+  // Fields the apply copies before any of the vectors these grow, since a
+  // table's fields are built in the order of their names.
+  static std::string siblingsBuiltFirst() {
+    auto json = std::string{R"({"b_vector": [)"};
+    for (auto i = 0; i < 1024; i++) {
+      json += (i == 0) ? "true" : ", true";
+    }
+    return json + "]}";
+  }
+
+  uint32_t memberOffset(const char* object, const char* member) {
+    return schema_->objects()
+        ->LookupByKey(object)
+        ->fields()
+        ->LookupByKey(member)
+        ->offset();
+  }
+
+  static std::vector<uint8_t> putRequest(const std::vector<uint32_t>& path,
+                                         const std::vector<uint8_t>& payload) {
+    flatbuffers::FlatBufferBuilder requestBuilder;
+    requestBuilder.Finish(serialized::CreateRequest(
+        requestBuilder, serialized::Operation::Put,
+        serialized::CreatePut(requestBuilder, requestBuilder.CreateVector(path),
+                              requestBuilder.CreateVector(payload))
+            .Union()));
+    return {requestBuilder.GetBufferPointer(),
+            requestBuilder.GetBufferPointer() + requestBuilder.GetSize()};
+  }
+
+  // A patch of the root holding a put of `payload` at `path`.
+  static std::vector<uint8_t> patchRequest(
+      const std::vector<uint32_t>& path, const std::vector<uint8_t>& payload) {
+    flatbuffers::FlatBufferBuilder requestBuilder;
+    const auto put =
+        serialized::CreatePut(requestBuilder, requestBuilder.CreateVector(path),
+                              requestBuilder.CreateVector(payload))
+            .Union();
+    const auto patch = serialized::CreatePatch(
+        requestBuilder, requestBuilder.CreateVector(std::vector<uint32_t>{}),
+        requestBuilder.CreateVector(std::vector{serialized::Operation::Put}),
+        requestBuilder.CreateVector(std::vector{put}));
+    requestBuilder.Finish(serialized::CreateRequest(
+        requestBuilder, serialized::Operation::Patch, patch.Union()));
+    return {requestBuilder.GetBufferPointer(),
+            requestBuilder.GetBufferPointer() + requestBuilder.GetSize()};
+  }
+
+  // Applies `request` to `initial` with a builder already holding
+  // `heldBytes` bytes of the caller's own, under a bound that leaves kBudget
+  // bytes past them. Answers the outcome and, where Applied, the finished
+  // buffer; checks that nothing was built otherwise.
+  std::pair<ApplyOutcome, std::vector<uint8_t>> apply(
+      const std::vector<uint8_t>& initial, const std::vector<uint8_t>& request,
+      size_t heldBytes) {
+    flatbuffers::FlatBufferBuilder fbb;
+    if (heldBytes > 0) {
+      fbb.CreateString(std::string(heldBytes, 'x'));
+    }
+    const auto held = fbb.GetSize();
+    const auto result = tryApplyRequestGrowingWithin(
+        fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
+        flatbuffers::GetRoot<serialized::Request>(request.data()), false,
+        held + kBudget);
+    if (result.outcome != ApplyOutcome::Applied) {
+      EXPECT_EQ(fbb.GetSize(), held);
+      return {result.outcome, {}};
+    }
+    fbb.Finish(result.root);
+    auto verifier =
+        flatbuffers::Verifier(fbb.GetBufferPointer(), fbb.GetSize());
+    EXPECT_TRUE(matcher_test::VerifyTestSchemaBuffer(verifier));
+    return {result.outcome,
+            {fbb.GetBufferPointer(), fbb.GetBufferPointer() + fbb.GetSize()}};
+  }
+
+  // One vector kind a put grows: the path to its element `index` and the
+  // payload written there, the bytes the bound counts per element, and
+  // whether a result holds the element written at `index`.
+  struct Kind {
+    const char* name;
+    uint64_t bytesPerElement;
+    std::function<std::vector<uint32_t>(uint32_t)> path;
+    std::vector<uint8_t> payload;
+    std::function<bool(const matcher_test::TestSchema*, uint32_t)> written;
+  };
+
+  std::vector<Kind> kinds() {
+    const auto integer = static_cast<uint32_t>(matcher_test::Number::Integer);
+    const auto value = memberOffset("matcher_test.Integer", "value");
+    const auto color = memberOffset("matcher_test.Marker", "color");
+    return {
+        {"i32_vector", 4,
+         [&](uint32_t i) {
+           return std::vector<uint32_t>{fieldOffset("i32_vector"), i};
+         },
+         flexPayload("7"),
+         [](const matcher_test::TestSchema* ts, uint32_t i) {
+           return ts->i32_vector() != nullptr
+                  and ts->i32_vector()->size() == i + 1
+                  and ts->i32_vector()->Get(i) == 7;
+         }},
+        {"string_vector", 16,
+         [&](uint32_t i) {
+           return std::vector<uint32_t>{fieldOffset("string_vector"), i};
+         },
+         flexPayload(R"("seven")"),
+         [](const matcher_test::TestSchema* ts, uint32_t i) {
+           return ts->string_vector() != nullptr
+                  and ts->string_vector()->size() == i + 1
+                  and ts->string_vector()->Get(i)->string_view() == "seven";
+         }},
+        {"object_vector", 16,
+         [&](uint32_t i) {
+           return std::vector<uint32_t>{fieldOffset("object_vector"), i,
+                                        fieldOffset("i32")};
+         },
+         flexPayload("7"),
+         [](const matcher_test::TestSchema* ts, uint32_t i) {
+           return ts->object_vector() != nullptr
+                  and ts->object_vector()->size() == i + 1
+                  and ts->object_vector()->Get(i)->i32() == 7;
+         }},
+        {"number_vector", 16,
+         [=, this](uint32_t i) {
+           return std::vector<uint32_t>{fieldOffset("number_vector"), i,
+                                        integer, value};
+         },
+         flexPayload("7"),
+         [](const matcher_test::TestSchema* ts, uint32_t i) {
+           return ts->number_vector() != nullptr
+                  and ts->number_vector()->size() == i + 1
+                  and ts->number_vector_type()->size() == i + 1
+                  and ts->number_vector_type()->Get(i)
+                          == matcher_test::Number::Integer
+                  and static_cast<const matcher_test::Integer*>(
+                          ts->number_vector()->Get(i))
+                              ->value()
+                          == 7;
+         }},
+        {"marker_vector", 2,
+         [=, this](uint32_t i) {
+           return std::vector<uint32_t>{fieldOffset("marker_vector"), i, color};
+         },
+         flexPayload("4"),
+         [](const matcher_test::TestSchema* ts, uint32_t i) {
+           return ts->marker_vector() != nullptr
+                  and ts->marker_vector()->size() == i + 1
+                  and ts->marker_vector()->Get(i)->color()
+                          == matcher_test::Color::Green;
+         }},
+    };
+  }
+};
+
+TEST_F(GrowthBoundTest, GrowsEveryVectorKindToTheBoundAndRefusesPastIt) {
+  const auto initial = GetBuffer(siblingsBuiltFirst());
+  for (const auto& kind : kinds()) {
+    const auto last = static_cast<uint32_t>(kBudget / kind.bytesPerElement - 1);
+    for (const size_t heldBytes : {0, 1000}) {
+      for (const auto patched : {false, true}) {
+        const auto request = [&](uint32_t index) {
+          return patched ? patchRequest(kind.path(index), kind.payload)
+                         : putRequest(kind.path(index), kind.payload);
+        };
+        const auto [outcome, result] = apply(initial, request(last), heldBytes);
+        ASSERT_EQ(outcome, ApplyOutcome::Applied)
+            << kind.name << " " << heldBytes << " " << patched;
+        const auto* ts = matcher_test::GetTestSchema(result.data());
+        EXPECT_TRUE(kind.written(ts, last))
+            << kind.name << " " << heldBytes << " " << patched;
+        ASSERT_NE(ts->b_vector(), nullptr);
+        EXPECT_EQ(ts->b_vector()->size(), 1024U);
+        EXPECT_EQ(apply(initial, request(last + 1), heldBytes).first,
+                  ApplyOutcome::Refused)
+            << kind.name << " " << heldBytes << " " << patched;
+      }
+    }
+  }
+}
+
+// A whole vector of structs is bounded by its count, which a payload sharing
+// one map between its elements does not bound.
+TEST_F(GrowthBoundTest, BuildsAWholeVectorOfStructsToTheBoundAndNoFurther) {
+  const auto initial = GetBuffer(siblingsBuiltFirst());
+  const auto payload = [](size_t elements) {
+    flexbuffers::Builder builder;
+    builder.Vector([&] {
+      for (size_t i = 0; i < elements; i++) {
+        builder.Map([&] {
+          builder.Bool("on", true);
+          builder.UInt("color", 4);
+        });
+      }
+    });
+    builder.Finish();
+    return builder.GetBuffer();
+  };
+  const auto markers = fieldOffset("marker_vector");
+  constexpr auto kMarkerBytes = 2;
+  constexpr auto kMost = kBudget / kMarkerBytes;
+  for (const size_t heldBytes : {0, 1000}) {
+    for (const auto patched : {false, true}) {
+      const auto request = [&](size_t elements) {
+        return patched ? patchRequest({markers}, payload(elements))
+                       : putRequest({markers}, payload(elements));
+      };
+      const auto [outcome, result] = apply(initial, request(kMost), heldBytes);
+      ASSERT_EQ(outcome, ApplyOutcome::Applied) << heldBytes << " " << patched;
+      const auto* ts = matcher_test::GetTestSchema(result.data());
+      ASSERT_NE(ts->marker_vector(), nullptr);
+      EXPECT_EQ(ts->marker_vector()->size(), kMost);
+      EXPECT_EQ(apply(initial, request(kMost + 1), heldBytes).first,
+                ApplyOutcome::Refused)
+          << heldBytes << " " << patched;
+    }
+  }
+}
+
+// The parser writes a path for every operation, a payload for every put,
+// and a type for every operation a patch holds, and stops a patch only at a
+// table or a struct. A hand-built request without one is refused, whatever
+// else it holds, rather than read as an edit it does not spell.
+class RequestShapeTest : public GrowthBoundTest {
+ protected:
+  // A request holding one patch along `path`, of the operations `build`
+  // adds through `add`.
+  template <typename Build>
+  std::vector<uint8_t> patchOf(const std::vector<uint32_t>& path, Build build) {
+    flatbuffers::FlatBufferBuilder requestBuilder;
+    auto types = std::vector<serialized::Operation>{};
+    auto values = std::vector<flatbuffers::Offset<void>>{};
+    build(requestBuilder, types, values);
+    const auto patch = serialized::CreatePatch(
+        requestBuilder, requestBuilder.CreateVector(path),
+        requestBuilder.CreateVector(types),
+        requestBuilder.CreateVector(values));
+    requestBuilder.Finish(serialized::CreateRequest(
+        requestBuilder, serialized::Operation::Patch, patch.Union()));
+    return {requestBuilder.GetBufferPointer(),
+            requestBuilder.GetBufferPointer() + requestBuilder.GetSize()};
+  }
+
+  static auto putOf(const std::vector<uint32_t>& path,
+                    const std::vector<uint8_t>& payload) {
+    return [=](flatbuffers::FlatBufferBuilder& builder,
+               std::vector<serialized::Operation>& types,
+               std::vector<flatbuffers::Offset<void>>& values) {
+      types.push_back(serialized::Operation::Put);
+      values.push_back(serialized::CreatePut(builder,
+                                             builder.CreateVector(path),
+                                             builder.CreateVector(payload))
+                           .Union());
+    };
+  }
+
+  static auto deleteOf(const std::vector<uint32_t>& path) {
+    return [=](flatbuffers::FlatBufferBuilder& builder,
+               std::vector<serialized::Operation>& types,
+               std::vector<flatbuffers::Offset<void>>& values) {
+      types.push_back(serialized::Operation::Delete);
+      values.push_back(
+          serialized::CreateDelete(builder, builder.CreateVector(path))
+              .Union());
+    };
+  }
+
+  static auto nothing() {
+    return
+        [](flatbuffers::FlatBufferBuilder&, std::vector<serialized::Operation>&,
+           std::vector<flatbuffers::Offset<void>>&) {};
+  }
+
+  std::vector<uint8_t> initial_ = GetBuffer(
+      R"({"i8": 1, "i32_vector": [1, 2], "string": "kept", "object": {"i8": 3},)"
+      R"( "number_type": "Integer", "number": {"value": 5},)"
+      R"( "number_vector_type": ["Integer"], "number_vector": [{"value": 4}],)"
+      R"( "struct_vector": [)"
+      + std::string(kStructA) + "]}");
+};
+
+TEST_F(RequestShapeTest, RefusesAnOperationMissingWhatTheParserWrites) {
+  // A put of the whole root, which an absent path would otherwise be read as.
+  const auto root = GetBuffer(R"({"i32": 9})");
+  flatbuffers::FlatBufferBuilder put;
+  put.Finish(serialized::CreateRequest(
+      put, serialized::Operation::Put,
+      serialized::CreatePut(put, 0, put.CreateVector(root)).Union()));
+  EXPECT_EQ(outcomeOfRequest(initial_, put.GetBufferPointer()),
+            ApplyOutcome::Refused);
+
+  flatbuffers::FlatBufferBuilder noPayload;
+  noPayload.Finish(serialized::CreateRequest(
+      noPayload, serialized::Operation::Put,
+      serialized::CreatePut(
+          noPayload,
+          noPayload.CreateVector(std::vector<uint32_t>{fieldOffset("i32")}))
+          .Union()));
+  EXPECT_EQ(outcomeOfRequest(initial_, noPayload.GetBufferPointer()),
+            ApplyOutcome::Refused);
+
+  flatbuffers::FlatBufferBuilder del;
+  del.Finish(serialized::CreateRequest(del, serialized::Operation::Delete,
+                                       serialized::CreateDelete(del).Union()));
+  EXPECT_EQ(outcomeOfRequest(initial_, del.GetBufferPointer()),
+            ApplyOutcome::Refused);
+
+  // A patch without its path, or without both its operations and their
+  // types, which the Request verifier takes only together; alone or in a
+  // patch.
+  const auto i8 = std::vector<uint32_t>{fieldOffset("i8")};
+  for (const auto& [offsets, types, updates] :
+       {std::array{false, true, true}, std::array{true, false, false}}) {
+    for (const auto nested : {false, true}) {
+      flatbuffers::FlatBufferBuilder builder;
+      const auto inner =
+          serialized::CreateDelete(builder, builder.CreateVector(i8)).Union();
+      auto patch = serialized::CreatePatch(
+          builder,
+          offsets ? builder.CreateVector(std::vector<uint32_t>{})
+                  : flatbuffers::Offset<flatbuffers::Vector<uint32_t>>{},
+          types
+              ? builder.CreateVector(std::vector{serialized::Operation::Delete})
+              : flatbuffers::Offset<
+                    flatbuffers::Vector<serialized::Operation>>{},
+          updates ? builder.CreateVector(std::vector{inner})
+                  : flatbuffers::Offset<
+                        flatbuffers::Vector<flatbuffers::Offset<void>>>{});
+      if (nested) {
+        patch = serialized::CreatePatch(
+            builder, builder.CreateVector(std::vector<uint32_t>{}),
+            builder.CreateVector(std::vector{serialized::Operation::Patch}),
+            builder.CreateVector(std::vector{patch.Union()}));
+      }
+      builder.Finish(serialized::CreateRequest(
+          builder, serialized::Operation::Patch, patch.Union()));
+      EXPECT_EQ(outcomeOfRequest(initial_, builder.GetBufferPointer()),
+                ApplyOutcome::Refused)
+          << offsets << types << updates << nested;
+    }
+  }
+
+  // An operation without a path inside a patch, which would name what the
+  // patch patches: the table `object`, deleted or replaced whole.
+  for (const auto replaces : {false, true}) {
+    const auto request = patchOf(
+        {fieldOffset("object")},
+        [&](flatbuffers::FlatBufferBuilder& builder,
+            std::vector<serialized::Operation>& types,
+            std::vector<flatbuffers::Offset<void>>& values) {
+          types.push_back(replaces ? serialized::Operation::Put
+                                   : serialized::Operation::Delete);
+          values.push_back(replaces
+                               ? serialized::CreatePut(
+                                     builder, 0, builder.CreateVector(root))
+                                     .Union()
+                               : serialized::CreateDelete(builder).Union());
+        });
+    EXPECT_EQ(outcomeOfRequest(initial_, request.data()), ApplyOutcome::Refused)
+        << replaces;
+  }
+}
+
+// The vectors one request grows share the bound: one grown inside an element
+// of another, and those the puts of one patch grow.
+TEST_F(RequestShapeTest, BoundsTheVectorsOneRequestGrowsTogether) {
+  const auto initial = GetBuffer(siblingsBuiltFirst());
+  // 100 elements of 16 bytes, which leave 2496 bytes, 624 int32s.
+  const auto nested = [&](uint32_t element) {
+    return putRequest(
+        {fieldOffset("object_vector"), 99, fieldOffset("i32_vector"), element},
+        flexPayload("7"));
+  };
+  const auto [outcome, result] = apply(initial, nested(623), 0);
+  ASSERT_EQ(outcome, ApplyOutcome::Applied);
+  const auto* ts = matcher_test::GetTestSchema(result.data());
+  ASSERT_NE(ts->object_vector(), nullptr);
+  ASSERT_EQ(ts->object_vector()->size(), 100U);
+  const auto* grown = ts->object_vector()->Get(99)->i32_vector();
+  ASSERT_NE(grown, nullptr);
+  ASSERT_EQ(grown->size(), 624U);
+  EXPECT_EQ(grown->Get(623), 7);
+  EXPECT_EQ(apply(initial, nested(624), 0).first, ApplyOutcome::Refused);
+
+  // 2400 bytes of int32s, beside the siblings, leave less than the 816 bytes
+  // 51 strings take, which alone fit.
+  const auto strings = std::vector<uint32_t>{fieldOffset("string_vector"), 50};
+  EXPECT_EQ(apply(initial, putRequest(strings, flexPayload(R"("s")")), 0).first,
+            ApplyOutcome::Applied);
+  const auto both = [&](uint32_t element) {
+    return patchOf({}, [&](flatbuffers::FlatBufferBuilder& builder,
+                           std::vector<serialized::Operation>& types,
+                           std::vector<flatbuffers::Offset<void>>& values) {
+      for (const auto& [path, json] :
+           {std::pair{std::vector<uint32_t>{fieldOffset("i32_vector"), element},
+                      "7"},
+            std::pair{strings, R"("s")"}}) {
+        types.push_back(serialized::Operation::Put);
+        values.push_back(
+            serialized::CreatePut(builder, builder.CreateVector(path),
+                                  builder.CreateVector(flexPayload(json)))
+                .Union());
+      }
+    });
+  };
+  EXPECT_EQ(apply(initial, both(599), 0).first, ApplyOutcome::Refused);
+  EXPECT_EQ(apply(initial, both(9), 0).first, ApplyOutcome::Applied);
+}
+
+// A whole vector is bounded by what it builds, which a payload sharing one
+// string or table between its elements does not bound.
+TEST_F(GrowthBoundTest, BuildsAWholeVectorToTheBoundAndNoFurther) {
+  const auto initial = GetBuffer(siblingsBuiltFirst());
+  const auto table = GetBuffer(R"({"i32": 1})");
+  const auto text = std::string(200, 's');
+  // A payload of `elements` references to the one value `push` writes.
+  const auto shared = [](size_t elements, const auto& push) {
+    flexbuffers::Builder builder;
+    const auto list = builder.StartVector();
+    push(builder);
+    const auto value = builder.LastValue();
+    for (size_t i = 1; i < elements; i++) {
+      builder.ReuseValue(value);
+    }
+    builder.EndVector(list, false, false);
+    builder.Finish();
+    return builder.GetBuffer();
+  };
+  const auto ints = [](size_t elements) {
+    flexbuffers::Builder builder;
+    builder.Vector([&] {
+      for (size_t i = 0; i < elements; i++) {
+        builder.Int(1);
+      }
+    });
+    builder.Finish();
+    return builder.GetBuffer();
+  };
+  const auto strings = [&](size_t elements) {
+    return shared(elements,
+                  [&](flexbuffers::Builder& builder) { builder.String(text); });
+  };
+  const auto tables = [&](size_t elements) {
+    return shared(elements, [&](flexbuffers::Builder& builder) {
+      builder.Blob(table.data(), table.size());
+    });
+  };
+  struct Whole {
+    const char* name;
+    std::function<std::vector<uint8_t>(size_t)> payload;
+    size_t most;
+  };
+  for (const auto& whole : {
+           Whole{"i32_vector", ints, kBudget / 4},
+           Whole{"string_vector", strings, kBudget / (text.size() + 16)},
+           Whole{"object_vector", tables, kBudget / (table.size() + 16)},
+       }) {
+    const auto field = std::vector<uint32_t>{fieldOffset(whole.name)};
+    EXPECT_EQ(
+        apply(initial, putRequest(field, whole.payload(whole.most)), 0).first,
+        ApplyOutcome::Applied)
+        << whole.name;
+    EXPECT_EQ(
+        apply(initial, putRequest(field, whole.payload(whole.most + 1)), 0)
+            .first,
+        ApplyOutcome::Refused)
+        << whole.name;
+  }
+}
+
+TEST_F(RequestShapeTest, RefusesAPatchStoppingAtNoTableOrStruct) {
+  const auto* integer = schema_->objects()->LookupByKey("matcher_test.Integer");
+  const auto value = integer->fields()->LookupByKey("value")->offset();
+  const auto kIntegerMember =
+      static_cast<uint32_t>(matcher_test::Number::Integer);
+  const auto structs = memberOffset("matcher_test.Nested", "structs");
+  const auto inner = memberOffset("matcher_test.Nested", "inner");
+  for (const auto& path : std::vector<std::vector<uint32_t>>{
+           {2},
+           {fieldOffset("i8")},
+           {fieldOffset("i8"), 5},
+           {fieldOffset("string")},
+           {fieldOffset("number_type")},
+           {fieldOffset("number")},
+           {fieldOffset("number"), kNone},
+           {fieldOffset("number"), kIntegerMember, value},
+           {fieldOffset("i32_vector")},
+           {fieldOffset("i32_vector"), 0},
+           {fieldOffset("string_vector"), 0},
+           {fieldOffset("object_vector")},
+           {fieldOffset("number_vector"), 0},
+           {fieldOffset("number_vector_type"), 0},
+           {fieldOffset("nested"), structs},
+           {fieldOffset("nested"), structs, 0},
+       }) {
+    // Empty, a put the path makes a write of a field, and a delete of an
+    // element of the vector it stops at, which concatenated with the path
+    // each spell an edit.
+    for (const auto& request :
+         {patchOf(path, nothing()), patchOf(path, putOf({}, flexPayload("5"))),
+          patchOf(path, deleteOf({0}))}) {
+      EXPECT_EQ(outcomeOfRequest(initial_, request.data()),
+                ApplyOutcome::Refused)
+          << ::testing::PrintToString(path);
+    }
+    // And the same patch inside a patch of the root.
+    const auto outer =
+        patchOf({}, [&](flatbuffers::FlatBufferBuilder& builder,
+                        std::vector<serialized::Operation>& types,
+                        std::vector<flatbuffers::Offset<void>>& values) {
+          types.push_back(serialized::Operation::Patch);
+          values.push_back(
+              serialized::CreatePatch(
+                  builder, builder.CreateVector(path),
+                  builder.CreateVector(std::vector<serialized::Operation>{}),
+                  builder.CreateVector(
+                      std::vector<flatbuffers::Offset<void>>{}))
+                  .Union());
+        });
+    EXPECT_EQ(outcomeOfRequest(initial_, outer.data()), ApplyOutcome::Refused)
+        << ::testing::PrintToString(path);
+  }
+  // Every place a patch may stop, empty: a copy.
+  for (const auto& path : std::vector<std::vector<uint32_t>>{
+           {},
+           {fieldOffset("object")},
+           {fieldOffset("object"), fieldOffset("object")},
+           {fieldOffset("number"), kIntegerMember},
+           {fieldOffset("object_vector"), 3},
+           {fieldOffset("number_vector"), 0, kIntegerMember},
+           {fieldOffset("scalars")},
+           {fieldOffset("struct_vector"), 0},
+           {fieldOffset("nested"), inner},
+       }) {
+    EXPECT_EQ(outcomeOfRequest(initial_, patchOf(path, nothing()).data()),
+              ApplyOutcome::Applied)
+        << ::testing::PrintToString(path);
+  }
+  EXPECT_EQ(outcomeOfRequest(initial_,
+                             patchOf({fieldOffset("number"), kIntegerMember},
+                                     putOf({value}, flexPayload("6")))
+                                 .data()),
+            ApplyOutcome::Applied);
+}
+
+TEST(PublicCopyTableTest, PoolsStringsOnlyWhenAsked) {
+  auto bfbs = std::string{};
+  ASSERT_TRUE(flatbuffers::LoadFile("test_schema.bfbs", true, &bfbs));
+  const auto* schema = reflection::GetSchema(bfbs.data());
+  flatbuffers::FlatBufferBuilder source;
+  const auto first = source.CreateString("same");
+  const auto second = source.CreateString("same");
+  const auto strings = source.CreateVector(std::vector{first, second});
+  auto builder = matcher_test::TestSchemaBuilder{source};
+  builder.add_string_vector(strings);
+  source.Finish(builder.Finish());
+  for (const auto pooled : {false, true}) {
+    flatbuffers::FlatBufferBuilder fbb;
+    copyTable(fbb, schema, source.GetBufferPointer(), pooled);
+    const auto* copied =
+        matcher_test::GetTestSchema(fbb.GetBufferPointer())->string_vector();
+    ASSERT_NE(copied, nullptr);
+    ASSERT_EQ(copied->size(), 2U);
+    EXPECT_EQ(copied->Get(0) == copied->Get(1), pooled);
+    EXPECT_EQ(copied->Get(1)->string_view(), "same");
+  }
 }

@@ -7,13 +7,22 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   return()
 endif()
 
-add_executable(fbrequest_fuzz_parse fuzz_parse.cpp)
-target_link_libraries(fbrequest_fuzz_parse
+foreach(target fbrequest_fuzz_parse fbrequest_fuzz_apply)
+  string(REPLACE "fbrequest_fuzz_" "fuzz_" source "${target}")
+  add_executable(${target} "${source}.cpp")
+  target_link_libraries(${target}
+    PRIVATE
+      FlatbuffersRequest::FlatbuffersRequest
+      flatbuffers::flatbuffers)
+  target_compile_options(${target} PRIVATE -fsanitize=fuzzer)
+  target_link_options(${target} PRIVATE -fsanitize=fuzzer)
+endforeach()
+
+# The apply target reads the test schema's text at startup, so that what it
+# fuzzes is the schema the suite covers.
+target_compile_definitions(fbrequest_fuzz_apply
   PRIVATE
-    FlatbuffersRequest::FlatbuffersRequest
-    flatbuffers::flatbuffers)
-target_compile_options(fbrequest_fuzz_parse PRIVATE -fsanitize=fuzzer)
-target_link_options(fbrequest_fuzz_parse PRIVATE -fsanitize=fuzzer)
+    FBREQUEST_FUZZ_SCHEMA="${PROJECT_SOURCE_DIR}/test/test_schema.fbs")
 
 # Instrument the library too, when the top-level build opted into sanitizers via
 # CMAKE_CXX_FLAGS (e.g. -fsanitize=fuzzer-no-link,address,undefined). Nothing to

@@ -34,6 +34,24 @@ The split follows what each half can know: the parser refuses what the schema
 alone decides -- a struct's members, an array's length -- and the apply
 decides what depends on the buffer.
 
+A hand-built request can hold what the parser never writes, so the apply
+first checks, once, the shape the schema alone decides: every operation is
+present and of a declared type, carries its path, a put its payload, a patch
+its operations with a type for each, and every patch stops at a table or a
+struct a put could reach. The classify pass then resolves each put's and
+delete's path against the buffer, and decides there, once, how far a request
+may grow vectors: the caller's builder, counted as it is on entry, and every
+vector the request grows or builds whole -- a vector grown inside an element
+of another, a whole vector counted at its payload's strings and tables once
+per element -- take at most half of what a flatbuffer holds together. A put
+in a patch counts, besides, the whole table the operations before it built,
+so the vectors several puts grow are bounded together. The builders grow every vector a request
+classified `Applied` grows, however much of the rest of the table they build
+first, so `Applied` always means the edit was made. The rest of the table is
+copied beside the vectors without a bound of its own: a source near what a
+flatbuffer holds, or one sharing a table between many offsets, can still
+build past it.
+
 ## Why offset paths, not field names
 
 The parsed `Request` records numeric vtable offsets rather than field names, so

@@ -9,14 +9,12 @@
 
 #include "ElementIndex.hpp"
 #include "PayloadValue.hpp"
+#include "RequestApply.hpp"
 #include "TableCopy.hpp"
 #include "fbrequest/FlatbufferRequest.hpp"
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/idl.h"
 #include "flatbuffers/reflection.h"
-
-// TODO: Hook up Patch and Delete
-// TODO: Add Struct and Array support
 
 using flatbuffers::FlatBufferBuilder;
 using flatbuffers::GetAnyRoot;
@@ -55,9 +53,10 @@ static uoffset_t applyRequestDelete(FlatBufferBuilder& fbb,
 
 flatbuffers::Offset<const flatbuffers::Table*> fbrequest::copyTable(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
-    const uint8_t* ptr, bool /*useStringPooling*/) {
-  const auto table = Offset<const Table*>(copyTableDeep(
-      fbb, schema, schema->root_table(), flatbuffers::GetAnyRoot(ptr), true));
+    const uint8_t* ptr, bool useStringPooling) {
+  const auto table = Offset<const Table*>(
+      copyTableDeep(fbb, schema, schema->root_table(),
+                    flatbuffers::GetAnyRoot(ptr), useStringPooling));
   fbb.Finish(table);
   return table;
 }
@@ -312,9 +311,6 @@ static uoffset_t applyRequestPut_GenerateStructVectorOffset(
     std::span<const uint8_t> payload) {
   const auto* vector = getFieldVA(sourceTable, fieldDef);
   const auto index = size_t{path.front()};
-  if (not structVectorCanGrowTo(structDef, index, fbb.GetSize())) {
-    return 0;
-  }
   const auto size = static_cast<size_t>(structDef->bytesize());
   const auto existingSize = (vector != nullptr) ? size_t{vector->size()} : 0;
   const auto* data = (vector != nullptr) ? vector->Data() : nullptr;
@@ -491,9 +487,6 @@ static uoffset_t applyRequestPut_GenerateScalarVectorOffset(
     reflection::BaseType elementBaseType, size_t alignment,
     std::array<uint8_t, 8> defaultValue = std::array<uint8_t, 8>{}) {
   const auto index = size_t{path.front()};
-  if (not vectorCanGrowTo(elementBaseType, index, fbb.GetSize())) {
-    return 0;
-  }
   const auto elementSize = GetTypeSize(elementBaseType);
   auto existingVectorSize = (vector != nullptr) ? vector->size() : size_t{0};
   auto initialValues = std::min(existingVectorSize, index);
@@ -541,9 +534,6 @@ static uoffset_t applyRequestPut_GenerateStringVectorOffset(
   const auto* vector = getFieldVS(sourceTable, fieldDef);
   const auto existingSize = (vector != nullptr) ? vector->size() : uoffset_t{0};
   auto index = path.front();
-  if (not vectorCanGrowTo(reflection::String, index, fbb.GetSize())) {
-    return 0;
-  }
   auto elements = std::vector<Offset<const String*>>{};
   elements.resize(std::max(existingSize, static_cast<uoffset_t>(index + 1)));
   for (uoffset_t i = 0; i < existingSize; i++) {
@@ -577,9 +567,6 @@ static uoffset_t applyRequestPut_GenerateObjectVectorOffset(
   const auto* vector = getFieldVT(sourceTable, fieldDef);
   const auto existingSize = (vector != nullptr) ? vector->size() : uoffset_t{0};
   auto index = path.front();
-  if (not vectorCanGrowTo(reflection::Obj, index, fbb.GetSize())) {
-    return 0;
-  }
   auto elements = std::vector<Offset<Table>>{};
   elements.resize(std::max(existingSize, index + 1U));
   for (uoffset_t i = 0; i < existingSize; i++) {
@@ -665,8 +652,7 @@ static uoffset_t applyRequestPut_GenerateUnionVectorOffset(
       getUnionTableDefFromEnumIndex(schema, unionTypeFieldDef, requestedMember);
   // A member that holds no table has nothing to write, as for a single union,
   // and the vector keeps what the buffer stores.
-  if (requestedDef == nullptr
-      or not vectorCanGrowTo(reflection::Union, index, fbb.GetSize())) {
+  if (requestedDef == nullptr) {
     return 0;
   }
   auto elements = std::vector<Offset<Table>>{};
@@ -1332,7 +1318,7 @@ static ApplyOutcome classifyPut(const reflection::Schema* schema,
                                 const Table* table,
                                 std::span<const uint8_t> payload,
                                 std::span<const uint32_t> path,
-                                uoffset_t bytesBuilt);
+                                uint64_t growthBudget);
 
 // Whether `payload` is a flatbuffer whose root is a table of `tableDef` that
 // the builders copy as it was written (see verifyTableBuffer). `payload` must
@@ -1367,6 +1353,28 @@ static bool tableListFits(const reflection::Schema* schema,
   return true;
 }
 
+// The most bytes the vector of `type` that `root`, a whole-vector payload the
+// classify pass accepted, builds, which a payload's size does not bound: each
+// of its elements may be an offset to one shared string or table, which the
+// builders copy once per element. A table is counted as its flatbuffer's
+// bytes.
+static uint64_t wholeVectorBytes(const reflection::Type* type,
+                                 flexbuffers::Reference root) {
+  const auto elements = root.AsVector();
+  if (IsScalar(type->element())) {
+    return uint64_t{elements.size()} * GetTypeSize(type->element());
+  }
+  auto bytes = uint64_t{0};
+  for (size_t i = 0; i < elements.size(); i++) {
+    const auto element = elements[i];
+    const auto size = (type->element() == reflection::String)
+                          ? element.AsString().size()
+                          : element.AsBlob().size();
+    bytes += uint64_t{size} + kMostBytesPerPaddedOffsetElement;
+  }
+  return bytes;
+}
+
 // `rest` is the path past `fieldDef`, a vector field of `tableDef`; `table` is
 // null where the buffer stores no such vector.
 static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
@@ -1375,7 +1383,7 @@ static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
                                         const Table* table,
                                         std::span<const uint8_t> payload,
                                         std::span<const uint32_t> rest,
-                                        uoffset_t bytesBuilt) {
+                                        uint64_t growthBudget) {
   const auto* type = fieldDef->type();
   const auto elementType = type->element();
   const auto* elementDef = (elementType == reflection::Obj)
@@ -1393,10 +1401,10 @@ static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
       return appliedIf(flexPayloadFits(payload, [&](auto root) {
         return payloadFits(schema, type, false, root)
                and structVectorCanHold(elementDef, root.AsVector().size(),
-                                       bytesBuilt);
+                                       growthBudget);
       }));
     }
-    if (not structVectorCanGrowTo(elementDef, rest.front(), bytesBuilt)) {
+    if (not structVectorCanGrowTo(elementDef, rest.front(), growthBudget)) {
       return ApplyOutcome::Refused;
     }
     return appliedIf(flexPayloadFits(payload, [&](auto root) {
@@ -1410,20 +1418,21 @@ static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
       // The members' types live in a second vector no payload carries.
       return ApplyOutcome::Refused;
     }
-    if (elementDef != nullptr) {
-      return appliedIf(flexPayloadFits(payload, [&](auto root) {
-        return tableListFits(schema, elementDef, root);
-      }));
-    }
     return appliedIf(flexPayloadFits(payload, [&](auto root) {
-      return payloadFits(schema, type, false, root);
+      const auto fits = (elementDef != nullptr)
+                            ? tableListFits(schema, elementDef, root)
+                            : payloadFits(schema, type, false, root);
+      return fits and wholeVectorBytes(type, root) <= growthBudget;
     }));
   }
   const auto index = rest.front();
   const auto deeper = rest.subspan(1);
-  if (not vectorCanGrowTo(elementType, index, bytesBuilt)) {
+  if (not vectorCanGrowTo(elementType, index, growthBudget)) {
     return ApplyOutcome::Refused;
   }
+  // What the path reaches inside the element is built beside the vector, so
+  // it shares what the vector leaves of the budget.
+  const auto deeperBudget = growthBudget - grownVectorBytes(elementType, index);
   const auto othersFaithful =
       otherElementsCopyFaithfully(schema, tableDef, fieldDef, table, index);
   if (elementDef != nullptr) {
@@ -1432,7 +1441,7 @@ static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
                               ? vector->Get(index)
                               : nullptr;
     return refusedUnlessFaithful(
-        classifyPut(schema, elementDef, element, payload, deeper, bytesBuilt),
+        classifyPut(schema, elementDef, element, payload, deeper, deeperBudget),
         othersFaithful);
   }
   if (elementType == reflection::Union) {
@@ -1454,7 +1463,7 @@ static ApplyOutcome classifyPutInVector(const reflection::Schema* schema,
     return refusedUnlessFaithful(
         classifyPut(schema, memberDef,
                     holdsMember ? vector->Get(index) : nullptr, payload,
-                    deeper.subspan(1), bytesBuilt),
+                    deeper.subspan(1), deeperBudget),
         othersFaithful);
   }
   if (not deeper.empty()) {
@@ -1473,7 +1482,7 @@ static ApplyOutcome classifyPutField(const reflection::Schema* schema,
                                      const Table* table,
                                      std::span<const uint8_t> payload,
                                      std::span<const uint32_t> rest,
-                                     uoffset_t bytesBuilt) {
+                                     uint64_t growthBudget) {
   const auto* type = fieldDef->type();
   switch (type->base_type()) {
     case reflection::Obj: {
@@ -1485,7 +1494,7 @@ static ApplyOutcome classifyPutField(const reflection::Schema* schema,
         }));
       }
       return classifyPut(schema, subDef, storedSubtable(table, fieldDef),
-                         payload, rest, bytesBuilt);
+                         payload, rest, growthBudget);
     }
     case reflection::Union: {
       if (rest.empty()) {
@@ -1502,13 +1511,13 @@ static ApplyOutcome classifyPutField(const reflection::Schema* schema,
           and storedUnionMember(tableDef, fieldDef, table) == member;
       return classifyPut(schema, memberDef,
                          held ? GetFieldT(*table, *fieldDef) : nullptr, payload,
-                         rest.subspan(1), bytesBuilt);
+                         rest.subspan(1), growthBudget);
     }
     case reflection::Vector:
     case reflection::Vector64:
       return classifyPutInVector(schema, tableDef, fieldDef,
                                  storesField(table, fieldDef) ? table : nullptr,
-                                 payload, rest, bytesBuilt);
+                                 payload, rest, growthBudget);
     case reflection::Array:
       return ApplyOutcome::Refused;
     default:
@@ -1525,13 +1534,15 @@ static ApplyOutcome classifyPutField(const reflection::Schema* schema,
 // flatbuffer payload, verified as that table; every other payload is a
 // flexbuffer, checked against the type it is written as. The fields of
 // `table` the path does not name are copied, so a put is Refused where one of
-// them does not copy faithfully.
+// them does not copy faithfully. A vector it grows, or builds whole of
+// structs, may take `growthBudget` bytes (see vectorGrowthBudget); the builders
+// grow every vector a put classified Applied grows.
 static ApplyOutcome classifyPut(const reflection::Schema* schema,
                                 const reflection::Object* tableDef,
                                 const Table* table,
                                 std::span<const uint8_t> payload,
                                 std::span<const uint32_t> path,
-                                uoffset_t bytesBuilt) {
+                                uint64_t growthBudget) {
   if (path.empty()) {
     return appliedIf(tablePayloadFits(schema, tableDef, payload));
   }
@@ -1541,22 +1552,130 @@ static ApplyOutcome classifyPut(const reflection::Schema* schema,
   }
   return refusedUnlessFaithful(
       classifyPutField(schema, tableDef, fieldDef, table, payload,
-                       path.subspan(1), bytesBuilt),
+                       path.subspan(1), growthBudget),
       copiesFaithfully(schema, tableDef, table, fieldDef));
 }
 
-// The offsets a put or delete carries, or none for a hand-built one that
-// carries no vector.
+// The offsets an operation carries, which `wellFormed` checks it does.
 static std::span<const uint32_t> operationPath(
     const Vector<uint32_t>* offsets) {
-  return (offsets != nullptr) ? std::span{offsets->data(), offsets->size()}
-                              : std::span<const uint32_t>{};
+  return std::span{offsets->data(), offsets->size()};
 }
 
+// The payload a put carries, which `wellFormed` checks it does.
 static std::span<const uint8_t> operationPayload(const Put* put) {
-  return (put->payload() != nullptr)
-             ? std::span{put->payload()->data(), put->payload()->size()}
-             : std::span<const uint8_t>{};
+  return std::span{put->payload()->data(), put->payload()->size()};
+}
+
+// ---------------------------------------------------------------------------
+// Request shape
+//
+// What the schema alone decides about a request is checked once, before any
+// operation is classified, so that the classify pass and the builders see
+// only a request of the shape the parser writes: every operation present and
+// of a type the union declares, with every member the parser writes, and
+// every patch stopping at a table or struct. The paths of puts and deletes
+// are resolved by the classify pass, against the buffer as well.
+// ---------------------------------------------------------------------------
+
+// The table or struct a patch along `path` from `objectDef` patches, or null
+// where the path stops anywhere else -- at a scalar, a string, a whole
+// vector, a union with no member named, or in an array -- or does not
+// resolve. `objectDef` itself for an empty path.
+static const reflection::Object* patchTarget(
+    const reflection::Schema* schema, const reflection::Object* objectDef,
+    std::span<const uint32_t> path) {
+  const auto* current = objectDef;
+  // The table member of the union `fieldDef` names that the next step names,
+  // consuming the step; null where there is none.
+  const auto takeMember =
+      [&](const reflection::Field* fieldDef) -> const reflection::Object* {
+    if (path.empty()) {
+      return nullptr;
+    }
+    const auto member = path.front();
+    path = path.subspan(1);
+    return getUnionTableDefFromEnumIndex(schema, fieldDef, member);
+  };
+  while (not path.empty()) {
+    const auto* fieldDef = fieldAtOffset(current, path.front());
+    path = path.subspan(1);
+    if (fieldDef == nullptr or isDiscriminator(fieldDef)) {
+      return nullptr;
+    }
+    const auto* type = fieldDef->type();
+    switch (type->base_type()) {
+      case reflection::Obj:
+        current = schema->objects()->Get(type->index());
+        break;
+      case reflection::Union:
+        current = takeMember(fieldDef);
+        break;
+      case reflection::Vector:
+        if (path.empty()) {
+          return nullptr;
+        }
+        path = path.subspan(1);
+        if (type->element() == reflection::Obj) {
+          current = schema->objects()->Get(type->index());
+        } else if (type->element() == reflection::Union) {
+          current = takeMember(fieldDef);
+        } else {
+          return nullptr;
+        }
+        break;
+      default:
+        return nullptr;
+    }
+    if (current == nullptr) {
+      return nullptr;
+    }
+  }
+  return current;
+}
+
+// Whether `operation`, of type `type`, is of the shape the parser writes,
+// its path relative to `objectDef`: a put carries a path and a payload, a
+// delete a path, and a patch a path to a table or struct (see patchTarget)
+// and one type for each of its operations, each of this shape relative to
+// what the patch patches.
+static bool wellFormed(const reflection::Schema* schema,
+                       const reflection::Object* objectDef, Operation type,
+                       const void* operation) {
+  if (operation == nullptr) {
+    return false;
+  }
+  switch (type) {
+    case Operation::Put: {
+      const auto* put = static_cast<const Put*>(operation);
+      return put->offsets() != nullptr and put->payload() != nullptr;
+    }
+    case Operation::Delete:
+      return static_cast<const Delete*>(operation)->offsets() != nullptr;
+    case Operation::Patch: {
+      const auto* patch = static_cast<const Patch*>(operation);
+      const auto* offsets = patch->offsets();
+      const auto* types = patch->updates_type();
+      const auto* updates = patch->updates();
+      if (offsets == nullptr or types == nullptr or updates == nullptr
+          or types->size() != updates->size()) {
+        return false;
+      }
+      const auto* target = patchTarget(
+          schema, objectDef, std::span{offsets->data(), offsets->size()});
+      if (target == nullptr) {
+        return false;
+      }
+      for (uoffset_t i = 0; i < updates->size(); i++) {
+        if (not wellFormed(schema, target, types->Get(i), updates->Get(i))) {
+          return false;
+        }
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1573,9 +1692,7 @@ static std::span<const uint8_t> operationPayload(const Put* put) {
 static std::vector<uint32_t> concatPath(std::span<const uint32_t> prefix,
                                         const Vector<uint32_t>* offsets) {
   auto full = std::vector<uint32_t>(prefix.begin(), prefix.end());
-  if (offsets != nullptr) {
-    full.insert(full.end(), offsets->begin(), offsets->end());
-  }
+  full.insert(full.end(), offsets->begin(), offsets->end());
   return full;
 }
 
@@ -1590,18 +1707,26 @@ static std::vector<uint32_t> concatPath(std::span<const uint32_t> prefix,
 // Refused one is not reported as NotStored; the list then answers NotStored.
 // `result` is meaningful only for Applied, and is left empty where no
 // operation built anything.
+//
+// Each put is classified against what `bytesHeld`, the bytes held beside the
+// list -- by the builder the result is folded into, and by the running table
+// of any patch the list is nested in -- and the running table the list has
+// built leave of `largestGrownVectorBytes` (see vectorGrowthBudget). So a
+// lone put in a patch grows a vector as far as it does alone, and the
+// vectors several puts grow are bounded together.
 static ApplyOutcome applyOperationList(
     const reflection::Schema* schema, const Table* sourceTable,
     std::span<const uint32_t> prefix,
     const Vector<serialized::Operation>* updateTypes,
     const Vector<flatbuffers::Offset<void>>* updates, bool useStringPooling,
+    uint64_t bytesHeld, uint64_t largestGrownVectorBytes,
     flatbuffers::DetachedBuffer& result) {
   const auto* rootDef = schema->root_table();
 
-  // An empty (or null) update list names no edit. It answers a standalone
-  // copy of the source so every caller -- a nested empty patch included --
-  // has a buffer to thread onward.
-  if (updates == nullptr or updates->size() == 0) {
+  // An empty update list names no edit. It answers a standalone copy of the
+  // source so every caller -- a nested empty patch included -- has a buffer
+  // to thread onward.
+  if (updates->size() == 0) {
     if (not copiesFaithfully(schema, rootDef, sourceTable)) {
       return ApplyOutcome::Refused;
     }
@@ -1611,10 +1736,6 @@ static ApplyOutcome applyOperationList(
     result = builder.Release();
     return ApplyOutcome::Applied;
   }
-  if (updateTypes == nullptr or updateTypes->size() != updates->size()) {
-    return ApplyOutcome::Refused;
-  }
-
   auto outcome = ApplyOutcome::Applied;
   const Table* source = sourceTable;
   // Takes `built` as the running table.
@@ -1624,9 +1745,6 @@ static ApplyOutcome applyOperationList(
   };
   for (uoffset_t i = 0; i < updates->size(); i++) {
     const auto* operation = updates->Get(i);
-    if (operation == nullptr) {
-      return ApplyOutcome::Refused;
-    }
     switch (updateTypes->Get(i)) {
       case Operation::Patch: {
         const auto* subpatch = static_cast<const Patch*>(operation);
@@ -1634,7 +1752,7 @@ static ApplyOutcome applyOperationList(
         const auto nestedOutcome = applyOperationList(
             schema, source, concatPath(prefix, subpatch->offsets()),
             subpatch->updates_type(), subpatch->updates(), useStringPooling,
-            nested);
+            bytesHeld + result.size(), largestGrownVectorBytes, nested);
         if (nestedOutcome == ApplyOutcome::Refused) {
           return ApplyOutcome::Refused;
         }
@@ -1651,7 +1769,9 @@ static ApplyOutcome applyOperationList(
         auto storage = std::vector<PayloadWord>{};
         const auto payload = alignPayload(operationPayload(put), storage);
         const auto path = concatPath(prefix, put->offsets());
-        if (classifyPut(schema, rootDef, source, payload, path, 0)
+        const auto budget = vectorGrowthBudget(bytesHeld + result.size(),
+                                               largestGrownVectorBytes);
+        if (classifyPut(schema, rootDef, source, payload, path, budget)
             != ApplyOutcome::Applied) {
           return ApplyOutcome::Refused;
         }
@@ -1689,10 +1809,11 @@ static ApplyOutcome applyOperationList(
 
 static fbrequest::ApplyResult applyRequestPatch(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
-    const Table* sourceTable, const Patch* patch, bool useStringPooling) {
+    const Table* sourceTable, const Patch* patch, bool useStringPooling,
+    uint64_t largestGrownVectorBytes) {
   const auto* rootDef = schema->root_table();
   const auto* updates = patch->updates();
-  if (updates == nullptr or updates->size() == 0) {
+  if (updates->size() == 0) {
     // A patch with no updates leaves the source unchanged.
     if (not copiesFaithfully(schema, rootDef, sourceTable)) {
       return {0, ApplyOutcome::Refused};
@@ -1705,7 +1826,8 @@ static fbrequest::ApplyResult applyRequestPatch(
   const auto outcome = applyOperationList(
       schema, sourceTable,
       concatPath(std::span<const uint32_t>{}, patch->offsets()),
-      patch->updates_type(), updates, useStringPooling, result);
+      patch->updates_type(), updates, useStringPooling, fbb.GetSize(),
+      largestGrownVectorBytes, result);
   if (outcome != ApplyOutcome::Applied) {
     return {0, outcome};
   }
@@ -2124,21 +2246,28 @@ static uoffset_t applyRequestDelete(FlatBufferBuilder& fbb,
   return fbb.EndTable(start);
 }
 
-fbrequest::ApplyResult fbrequest::tryApplyRequest(
+fbrequest::ApplyResult fbrequest::tryApplyRequestGrowingWithin(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
-    const Table* sourceTable, const Request* request, bool useStringPooling) {
+    const Table* sourceTable, const Request* request, bool useStringPooling,
+    uint64_t largestGrownVectorBytes) {
   const auto* rootTableDef = schema->root_table();
+  if (not wellFormed(schema, rootTableDef, request->operation_type(),
+                     request->operation())) {
+    return {0, ApplyOutcome::Refused};
+  }
+  // Past the real bound a grown vector could overrun what a flatbuffer holds.
+  largestGrownVectorBytes =
+      std::min(largestGrownVectorBytes, kLargestGrownVectorBytes);
+  const auto budget =
+      vectorGrowthBudget(fbb.GetSize(), largestGrownVectorBytes);
   switch (request->operation_type()) {
     case Operation::Put: {
       const auto* put = request->operation_as_Put();
-      if (put == nullptr) {
-        return {0, ApplyOutcome::Refused};
-      }
       auto storage = std::vector<PayloadWord>{};
       const auto payload = alignPayload(operationPayload(put), storage);
       const auto path = operationPath(put->offsets());
-      const auto outcome = classifyPut(schema, rootTableDef, sourceTable,
-                                       payload, path, fbb.GetSize());
+      const auto outcome =
+          classifyPut(schema, rootTableDef, sourceTable, payload, path, budget);
       if (outcome != ApplyOutcome::Applied) {
         return {0, outcome};
       }
@@ -2146,20 +2275,13 @@ fbrequest::ApplyResult fbrequest::tryApplyRequest(
                               path, useStringPooling),
               ApplyOutcome::Applied};
     }
-    case Operation::Patch: {
-      const auto* patch = request->operation_as_Patch();
-      if (patch == nullptr) {
-        return {0, ApplyOutcome::Refused};
-      }
-      return applyRequestPatch(fbb, schema, sourceTable, patch,
-                               useStringPooling);
-    }
+    case Operation::Patch:
+      return applyRequestPatch(fbb, schema, sourceTable,
+                               request->operation_as_Patch(), useStringPooling,
+                               largestGrownVectorBytes);
     case Operation::Delete: {
-      const auto* del = request->operation_as_Delete();
-      if (del == nullptr) {
-        return {0, ApplyOutcome::Refused};
-      }
-      const auto path = operationPath(del->offsets());
+      const auto path =
+          operationPath(request->operation_as_Delete()->offsets());
       const auto outcome =
           classifyDelete(schema, rootTableDef, sourceTable, path);
       if (outcome != ApplyOutcome::Applied) {
@@ -2172,6 +2294,14 @@ fbrequest::ApplyResult fbrequest::tryApplyRequest(
     default:
       return {0, ApplyOutcome::Refused};
   }
+}
+
+fbrequest::ApplyResult fbrequest::tryApplyRequest(
+    FlatBufferBuilder& fbb, const reflection::Schema* schema,
+    const Table* sourceTable, const Request* request, bool useStringPooling) {
+  return tryApplyRequestGrowingWithin(fbb, schema, sourceTable, request,
+                                      useStringPooling,
+                                      kLargestGrownVectorBytes);
 }
 
 bool fbrequest::verifyBuffer(const reflection::Schema* schema,

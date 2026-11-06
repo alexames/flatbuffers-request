@@ -15,6 +15,7 @@ using ByteBuffer = std::vector<uint8_t>;
 
 // Deep-copies the table at `ptr` (interpreted against `schema`'s root type)
 // into `fbb`, finishing the buffer. Returns the offset of the copied root.
+// With `useStringPooling`, identical strings share one copy in the output.
 // Every field is read as its type declares it, as `verifyBuffer` reads it,
 // and keeps its alignment. A union payload stored under NONE or under a member
 // its union does not declare has no layout to copy it by: a union field keeps
@@ -71,9 +72,15 @@ enum class ApplyOutcome : uint8_t {
   // so nothing is built: a path the schema does not resolve, a union member
   // that holds no table, a delete inside a struct, a put whose payload is not
   // of its field's kind or writes nothing (a struct map naming no member or
-  // an undeclared one, an empty array or one past its length), or a vector
-  // grown past what a flatbuffer holds. The parser refuses each of these; a
-  // hand-built request can still carry one.
+  // an undeclared one, an empty array or one past its length), or vectors
+  // grown past the bound below. The parser refuses each of these, the last
+  // only as it would be for an empty builder; a hand-built request can still
+  // carry one.
+  //
+  // Also a request missing a member the parser always writes -- an
+  // operation's path, a put's payload, a patch's operations and their types
+  // -- and a patch whose path stops anywhere but a table or a struct a put
+  // could reach, whatever operations it holds.
   //
   // Also an operation that would copy, unedited, what no copy keeps as it
   // was, in the source or in a put's value: a union payload stored under NONE
@@ -102,7 +109,15 @@ struct ApplyResult {
 // table the operations before it left; the patch answers Refused where any
 // is Refused, otherwise NotStored where any is NotStored, and builds nothing
 // for either. An empty patch names no edit: it is Applied and builds a copy,
-// whatever its path.
+// where its path stops at a table or a struct a put could reach, and is
+// Refused elsewhere, as any patch is.
+//
+// The bytes `fbb` holds on entry, and those of every vector a request grows
+// or builds whole -- each counted at the most its elements take, a string or
+// table at its payload's bytes -- are at most half of what a flatbuffer
+// holds together, or the request is Refused. A request that is Applied grows
+// every vector it names. What the rest of the table copies beside them is not
+// counted.
 //
 // @param fbb Builder the new root is built into. Nothing is added to it for an
 //     outcome other than Applied. The caller finishes it.
