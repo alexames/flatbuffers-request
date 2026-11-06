@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- A `put` read the flatbuffer or flexbuffer its payload carries in place,
+  even where it did not start on an 8-byte boundary: the request's payload
+  vector guarantees 4, and each table of a vector-of-tables payload, stored as
+  a flexbuffer blob, as little as 1. That is undefined behaviour (UBSan reports
+  it for `put object_vector [{"i8": 9}]`) and faults on targets that trap on
+  misaligned loads. Such a payload is now copied to aligned storage first.
+
 ## [0.4.1] - 2026-09-20
 
 ### Fixed

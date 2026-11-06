@@ -1,6 +1,9 @@
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <ranges>
 #include <span>
+#include <vector>
 
 #include "fbrequest/FlatbufferRequest.hpp"
 #include "fbrequest/FlatbufferRequest_generated.h"
@@ -236,6 +239,15 @@ INSTANTIATE_TEST_SUITE_P(
         TestArgs(R"({"object_vector":                            [{"i8":1}]})", R"(put object_vector [{"i8":9}, {"i8":9}])", R"({"object_vector": [{"i8":9}, {"i8":9}]})"),
         TestArgs(R"({"object_vector": [{"i8":1},{"i8":1},{"i8":1},{"i8":1}]})", R"(put object_vector [{"i8":9}, {"i8":9}])", R"({"object_vector": [{"i8":9}, {"i8":9}]})"),
 
+        // Payloads holding 8-byte scalars. A payload, or a table nested in one as a
+        // flexbuffer blob, is carried at whatever alignment its container gives it,
+        // which an 8-byte (or, for a blob, a 4-byte) read in place can misalign.
+        TestArgs(R"({})", R"(put object_vector [{"i64": 9223372036854775807}, {"i8": 1, "f64": 0.1}, {"ui64": 18446744073709551615}])", R"({"object_vector": [{"i64": 9223372036854775807}, {"i8": 1, "f64": 0.1}, {"ui64": 18446744073709551615}]})"),
+        TestArgs(R"({})", R"(put object {"i64": 9223372036854775807, "f64": 0.1})", R"({"object": {"i64": 9223372036854775807, "f64": 0.1}})"),
+        TestArgs(R"({})", "put i64 9223372036854775807", R"({"i64": 9223372036854775807})"),
+        TestArgs(R"({})", "put f64 0.1",                 R"({"f64": 0.1})"),
+        TestArgs(R"({})", "put i64_vector [9223372036854775807, -9223372036854775808]", R"({"i64_vector": [9223372036854775807, -9223372036854775808]})"),
+
         TestArgs(R"({                  })", R"(put i32_vector[0] 99)", R"({"i32_vector": [99]})"),
         TestArgs(R"({"i32_vector":   []})", R"(put i32_vector[0] 99)", R"({"i32_vector": [99]})"),
         TestArgs(R"({"i32_vector": [10]})", R"(put i32_vector[0] 99)", R"({"i32_vector": [99]})"),
@@ -405,6 +417,7 @@ INSTANTIATE_TEST_SUITE_P(
         TestArgs(R"({})", R"(patch { put i8 99 ; put i16 88 })", R"({"i8": 99, "i16": 88})"),
         TestArgs(R"({})", R"(patch { put string "hi" ; put i8 5 })", R"({"string": "hi", "i8": 5})"),
         TestArgs(R"({})", R"(patch { put object {"i32": 7} ; put i8 5 })", R"({"object": {"i32": 7}, "i8": 5})"),
+        TestArgs(R"({})", R"(patch { put object {"i64": 9223372036854775807, "f64": 0.1} ; put f64 0.1 })", R"({"object": {"i64": 9223372036854775807, "f64": 0.1}, "f64": 0.1})"),
         // Put + delete together.
         TestArgs(R"({"i8": 1, "i16": 2})", R"(patch { put i8 99 ; delete i16 })", R"({"i8": 99})"),
         TestArgs(R"({"i32_vector": [1,2,3]})", R"(patch { delete i32_vector[1] ; put i8 9 })", R"({"i8": 9, "i32_vector": [1,3]})"),
@@ -714,6 +727,72 @@ TEST_F(RefusedPutTest, RefusesAWholeVectorOfUnions) {
 
 // A struct member that is itself a struct, and an array whose elements are
 // structs.
+class PayloadAlignmentTest : public BufferRequestTest {
+ protected:
+  /// Applies `request` to an empty table with the request buffer moved to
+  /// `shift` bytes past an 8-byte boundary, which moves its payload with it.
+  ///
+  /// @param request The request text to parse and apply.
+  /// @param shift Bytes past an 8-byte boundary to place the request at; a
+  ///     multiple of 4, which is all a request buffer itself needs.
+  /// @return The verified result of the apply.
+  flatbuffers::DetachedBuffer applyShifted(const char* request, size_t shift) {
+    auto parsed = parseFlatbufferRequest(schema_, request);
+    EXPECT_TRUE(parsed.has_value()) << request;
+    if (not parsed.has_value()) {
+      return {};
+    }
+    auto words = std::vector<uint64_t>((parsed->size() + shift + 7) / 8);
+    auto* shifted = reinterpret_cast<uint8_t*>(words.data()) + shift;
+    std::memcpy(shifted, parsed->data(), parsed->size());
+
+    const auto initial = GetBuffer("{}");
+    flatbuffers::FlatBufferBuilder fbb;
+    fbb.Finish(
+        applyRequest(fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
+                     flatbuffers::GetRoot<serialized::Request>(shifted)));
+    auto result = fbb.Release();
+    auto verifier = flatbuffers::Verifier(result.data(), result.size());
+    EXPECT_TRUE(matcher_test::VerifyTestSchemaBuffer(verifier)) << request;
+    return result;
+  }
+};
+
+TEST_F(PayloadAlignmentTest, ReadsATablePayloadAtEitherFourByteOffset) {
+  for (const size_t shift : {0, 4}) {
+    auto result = applyShifted(
+        R"(put object {"i64": 9223372036854775807, "f64": 0.1})", shift);
+    const auto* ts = matcher_test::GetTestSchema(result.data());
+    ASSERT_NE(ts->object(), nullptr) << shift;
+    EXPECT_EQ(ts->object()->i64(), 9223372036854775807) << shift;
+    EXPECT_EQ(ts->object()->f64(), 0.1) << shift;
+  }
+}
+
+TEST_F(PayloadAlignmentTest, ReadsAFlexbufferPayloadAtEitherFourByteOffset) {
+  for (const size_t shift : {0, 4}) {
+    auto result = applyShifted("put f64 0.1", shift);
+    EXPECT_EQ(matcher_test::GetTestSchema(result.data())->f64(), 0.1) << shift;
+  }
+}
+
+TEST_F(PayloadAlignmentTest, ReadsEveryTableOfAVectorPayload) {
+  for (const size_t shift : {0, 4}) {
+    auto result = applyShifted(
+        R"(put object_vector [{"i8": 1}, {"i64": 9223372036854775807}, )"
+        R"({"i8": 2, "f64": 0.1}])",
+        shift);
+    const auto* vector =
+        matcher_test::GetTestSchema(result.data())->object_vector();
+    ASSERT_NE(vector, nullptr) << shift;
+    ASSERT_EQ(vector->size(), 3U) << shift;
+    EXPECT_EQ(vector->Get(0)->i8(), 1) << shift;
+    EXPECT_EQ(vector->Get(1)->i64(), 9223372036854775807) << shift;
+    EXPECT_EQ(vector->Get(2)->i8(), 2) << shift;
+    EXPECT_EQ(vector->Get(2)->f64(), 0.1) << shift;
+  }
+}
+
 class NestedStructTest : public BufferRequestTest {};
 
 TEST_F(NestedStructTest, PutsAMemberOfAStructInsideAStruct) {

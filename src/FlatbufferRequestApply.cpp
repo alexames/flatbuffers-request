@@ -1,7 +1,10 @@
 #include <array>
+#include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "fbrequest/FlatbufferRequest.hpp"
 #include "flatbuffers/flatbuffers.h"
@@ -60,6 +63,52 @@ static uoffset_t CopyTable_GenerateObjectOffset(
     FlatBufferBuilder& fbb, const reflection::Schema* schema,
     const reflection::Object* tableDef, const reflection::Field* fieldDef,
     const Table* sourceTable, bool useStringPooling);
+
+// The widest scalar a flatbuffer or a flexbuffer stores. A flexbuffer aligns
+// each value to its width from its start, and a finished flatbuffer is padded
+// so its fields align from its start too, so either is read in place only
+// from an address on this boundary.
+constexpr std::size_t kPayloadAlignment = 8;
+
+struct alignas(kPayloadAlignment) PayloadWord {
+  std::array<uint8_t, kPayloadAlignment> bytes;
+};
+
+static bool isPayloadAligned(std::span<const uint8_t> bytes) {
+  return reinterpret_cast<std::uintptr_t>(bytes.data()) % kPayloadAlignment
+         == 0;
+}
+
+// `bytes`, or a copy of them in `storage` where they do not start on a
+// kPayloadAlignment boundary. A buffer nested in a request is only as aligned
+// as what carries it: a [uint8] vector's data is 4-byte aligned within the
+// request buffer, and a flexbuffer blob's only to the width of its length
+// prefix, often 1 byte. The span returned is valid while both `bytes` and
+// `storage` are.
+static std::span<const uint8_t> alignPayload(
+    std::span<const uint8_t> bytes, std::vector<PayloadWord>& storage) {
+  if (bytes.empty() or isPayloadAligned(bytes)) {
+    return bytes;
+  }
+  storage.resize((bytes.size() + kPayloadAlignment - 1) / kPayloadAlignment);
+  std::memcpy(storage.data(), bytes.data(), bytes.size());
+  return {reinterpret_cast<const uint8_t*>(storage.data()), bytes.size()};
+}
+
+// The root table of the flatbuffer `payload` holds, which must already be
+// aligned (see alignPayload).
+static const Table& payloadTableRoot(std::span<const uint8_t> payload) {
+  assert(payload.empty() or isPayloadAligned(payload));
+  return *GetAnyRoot(payload.data());
+}
+
+// The root of the flexbuffer `payload` holds, which must already be aligned
+// (see alignPayload).
+static flexbuffers::Reference payloadFlexRoot(
+    std::span<const uint8_t> payload) {
+  assert(payload.empty() or isPayloadAligned(payload));
+  return flexbuffers::GetRoot(payload.data(), payload.size());
+}
 
 template <typename IntegerType>
 const static Vector<IntegerType>* getFieldVI(
@@ -382,7 +431,7 @@ static std::optional<std::vector<uint8_t>> buildStructImage(
       std::memcpy(image.data(), stored, image.size());
     }
   }
-  const auto value = flexbuffers::GetRoot(payload.data(), payload.size());
+  const auto value = payloadFlexRoot(payload);
   if (writeStructMember(schema, structDef, image, path, value)
       != StructWrite::Wrote) {
     return std::nullopt;
@@ -406,13 +455,13 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
       return 0;
     }
     case reflection::String: {
-      const auto root = flexbuffers::GetRoot(payload.data(), payload.size());
+      const auto root = payloadFlexRoot(payload);
       assert(root.IsString());
       return createString(fbb, root.AsString(), useStringPooling);
     }
     case reflection::Vector: {
       auto elementType = fieldDef->type()->element();
-      const auto root = flexbuffers::GetRoot(payload.data(), payload.size());
+      const auto root = payloadFlexRoot(payload);
       assert(root.IsVector());
       auto vector = root.AsVector();
 
@@ -439,12 +488,15 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
       if (fieldDef->type()->element() == reflection::Obj) {
         auto tables = std::vector<Offset<Table>>{};
         tables.resize(vector.size());
+        auto storage = std::vector<PayloadWord>{};
         for (auto i = 0; i < vector.size(); i++) {
           auto blob = vector[i].AsBlob();
           const auto* tableDef =
               schema->objects()->Get(fieldDef->type()->index());
+          const auto element =
+              alignPayload(std::span{blob.data(), blob.size()}, storage);
           tables[i] = CopyTable(fbb, *schema, *tableDef,
-                                *GetAnyRoot(blob.data()), useStringPooling)
+                                payloadTableRoot(element), useStringPooling)
                           .o;
         }
         return fbb.CreateVector(tables.data(), tables.size()).o;
@@ -452,12 +504,15 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
       if (fieldDef->type()->element() == reflection::Union) {
         auto tables = std::vector<Offset<Table>>{};
         tables.resize(vector.size());
+        auto storage = std::vector<PayloadWord>{};
         for (auto i = 0; i < vector.size(); i++) {
           auto blob = vector[i].AsBlob();
           const auto* tableDef =
               schema->objects()->Get(fieldDef->type()->index());
+          const auto element =
+              alignPayload(std::span{blob.data(), blob.size()}, storage);
           tables[i] = CopyTable(fbb, *schema, *tableDef,
-                                *GetAnyRoot(blob.data()), useStringPooling)
+                                payloadTableRoot(element), useStringPooling)
                           .o;
         }
         return fbb.CreateVector(tables.data(), tables.size()).o;
@@ -474,7 +529,7 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
         // a table root here would be reading it as something it is not.
         return 0;
       }
-      return CopyTable(fbb, *schema, *subTableDef, *GetAnyRoot(payload.data()),
+      return CopyTable(fbb, *schema, *subTableDef, payloadTableRoot(payload),
                        useStringPooling)
           .o;
     }
@@ -483,8 +538,8 @@ static uoffset_t copyPayload(FlatBufferBuilder& fbb,
       auto unionEnumIndex = path[1];
       const auto* unionTableDef =
           getUnionTableDefFromEnumIndex(schema, fieldDef, unionEnumIndex);
-      return CopyTable(fbb, *schema, *unionTableDef,
-                       *GetAnyRoot(payload.data()), useStringPooling)
+      return CopyTable(fbb, *schema, *unionTableDef, payloadTableRoot(payload),
+                       useStringPooling)
           .o;
     }
     case reflection::Array: {
@@ -507,7 +562,7 @@ static void copyOperationScalar(FlatBufferBuilder& fbb,
                                 std::span<const uint8_t> payload, size_t align,
                                 size_t size) {
   auto baseType = fieldDef->type()->base_type();
-  auto root = flexbuffers::GetRoot(payload.data(), payload.size());
+  auto root = payloadFlexRoot(payload);
   auto bytes = std::array<uint8_t, 8>{};
   getFlexbufferScalarDataPointer(root, baseType, &bytes);
 
@@ -559,7 +614,7 @@ static uoffset_t applyRequestPut_GenerateScalarVectorOffset(
   }
 
   // Add the new element itself.
-  auto root = flexbuffers::GetRoot(payload.data(), payload.size());
+  auto root = payloadFlexRoot(payload);
   auto bytes = std::array<uint8_t, 8>{};
   getFlexbufferScalarDataPointer(root, elementBaseType, &bytes);
   fbb.PushBytes(bytes.data(), elementSize);
@@ -644,7 +699,9 @@ static uoffset_t applyRequestPut_GenerateUTypeVectorOffset(
   const auto* vector =
       sourceTable->GetPointer<const VectorOfAny*>(fieldDef->offset());
 
-  auto flexbufferValue =
+  // Aligned only because every payload is (see payloadFlexRoot): a 1-byte
+  // wide flexbuffer has no wider value to misread.
+  alignas(kPayloadAlignment) auto flexbufferValue =
       std::array<uint8_t, 3>{static_cast<uint8_t>(path[1]), 0x08, 0x01};
   static const auto kDefaultEnumValues =
       std::array<uint8_t, 8>{1, 1, 1, 1, 1, 1, 1, 1};
@@ -1113,7 +1170,7 @@ uoffset_t applyRequestPut(FlatBufferBuilder& fbb,
                           const std::span<const uint16_t> path,
                           bool useStringPooling) {
   if (path.empty()) {
-    return CopyTable(fbb, *schema, *tableDef, *GetAnyRoot(payload.data()),
+    return CopyTable(fbb, *schema, *tableDef, payloadTableRoot(payload),
                      useStringPooling)
         .o;
   }
@@ -1183,9 +1240,12 @@ static flatbuffers::DetachedBuffer applyOperationList(
       case Operation::Put: {
         const auto* put = static_cast<const Put*>(updates->Get(i));
         FlatBufferBuilder builder;
+        auto storage = std::vector<PayloadWord>{};
         auto offset = applyRequestPut(
             builder, schema, rootDef, source,
-            std::span{put->payload()->data(), put->payload()->size()},
+            alignPayload(
+                std::span{put->payload()->data(), put->payload()->size()},
+                storage),
             concatPath(prefix, put->offsets()), useStringPooling);
         builder.Finish(Offset<Table>(offset));
         current = builder.Release();
@@ -1623,9 +1683,12 @@ flatbuffers::Offset<const flatbuffers::Table*> fbrequest::applyRequest(
     case Operation::Put: {
       const auto* put = request->operation_as_Put();
       const auto* offsets = put->offsets();
+      auto storage = std::vector<PayloadWord>{};
       return applyRequestPut(
           fbb, schema, rootTableDef, sourceTable,
-          std::span{put->payload()->data(), put->payload()->size()},
+          alignPayload(
+              std::span{put->payload()->data(), put->payload()->size()},
+              storage),
           std::span{offsets->data(), offsets->size()}, useStringPooling);
     }
     case Operation::Patch: {
