@@ -49,7 +49,8 @@ flatbuffers::Offset<const flatbuffers::Table*> copyTable(
 // Parses a textual request (`put` / `patch` / `delete`) against `schema` into a
 // serialized Request buffer. Returns nullopt when the request is malformed.
 // Only the bytes `requestString` views are read; it need not be terminated.
-// Read the result with
+// The buffer returned passes `serialized::VerifyRequestBuffer`, whatever kind
+// of payload it carries. Read the result with
 // flatbuffers::GetRoot<serialized::Request>(buffer.data()).
 std::optional<ByteBuffer> parseFlatbufferRequest(
     const reflection::Schema* schema, std::string_view requestString);
@@ -126,10 +127,12 @@ struct ApplyResult {
 // @param sourceTable Root table to apply the request to, of `schema`'s root
 //     type, in a buffer that `verifyBuffer` accepts. Read, not stored; it
 //     need not outlive the call.
-// @param request The request, in a buffer that passes the verifier for
-//     `serialized::Request`: as `parseFlatbufferRequest` serializes one, or
-//     built by hand. What the verifier does not check -- what its paths name,
-//     what its payloads hold -- is checked here. Read, not stored.
+// @param request The request, in a buffer that passes
+//     `serialized::VerifyRequestBuffer`: as `parseFlatbufferRequest`
+//     serializes one, or built by hand. What that verifier does not check
+//     is checked here: what its paths name, and what each payload holds,
+//     verified as the flatbuffer or flexbuffer its path calls for. Read, not
+//     stored.
 // @param useStringPooling When true, identical strings are shared in the
 //     output.
 // @return The root built and Applied, or a null root and why nothing was

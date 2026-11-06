@@ -44,6 +44,13 @@ std::ostream& operator<<(std::ostream& out, const TestArgs& args) {
   return out;
 }
 
+// Whether `request`, a serialized Request, passes the generated Request
+// verifier, which `tryApplyRequest` takes as its precondition.
+bool verifiesAsRequest(const ByteBuffer& request) {
+  auto verifier = flatbuffers::Verifier(request.data(), request.size());
+  return serialized::VerifyRequestBuffer(verifier);
+}
+
 // Applies `request` to `source` and finishes `fbb` with the result, failing
 // the test unless the apply is Applied. Where it is not, `fbb` is finished
 // with a copy of `source`, so a caller reading fields reads a whole buffer.
@@ -100,6 +107,7 @@ class RequestTestBase : public ::testing::TestWithParam<TestArgs> {
       copyTable(builder, schema_, emptyBuffer_.data(), false);
       return builder.Release();
     }
+    EXPECT_TRUE(verifiesAsRequest(*request)) << requestStr;
 
     finishApplied(builder, schema_,
                   flatbuffers::GetAnyRoot(emptyBuffer_.data()),
@@ -379,6 +387,8 @@ TEST_P(UpdateTableTest, PutScalarInRoot) {
   ASSERT_TRUE(request.has_value()) << true << args.initial << '\n'
                                    << args.request << '\n'
                                    << args.final;
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_TRUE(verifiesAsRequest(*request)) << args.request;
 
   auto startingValue =
       flatbuffers::TypedBuffer(schema_, GetBuffer(args.initial));
@@ -451,6 +461,8 @@ TEST_P(DeleteTableTest, Delete) {
   auto request = parseFlatbufferRequest(schema_, args.request);
   ASSERT_TRUE(request.has_value())
       << "Failed to parse request: " << args.request;
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_TRUE(verifiesAsRequest(*request)) << args.request;
 
   auto startingValue =
       flatbuffers::TypedBuffer(schema_, GetBuffer(args.initial));
@@ -500,6 +512,8 @@ TEST_P(PatchTableTest, Patch) {
   auto request = parseFlatbufferRequest(schema_, args.request);
   ASSERT_TRUE(request.has_value())
       << "Failed to parse request: " << args.request;
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_TRUE(verifiesAsRequest(*request)) << args.request;
 
   auto startingValue =
       flatbuffers::TypedBuffer(schema_, GetBuffer(args.initial));
@@ -577,6 +591,8 @@ TEST_P(NotStoredDeleteTest, BuildsNothing) {
   auto request = parseFlatbufferRequest(schema_, args.request);
   ASSERT_TRUE(request.has_value())
       << "Failed to parse request: " << args.request;
+  // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+  EXPECT_TRUE(verifiesAsRequest(*request)) << args.request;
   const auto initial = GetBuffer(args.initial);
   flatbuffers::FlatBufferBuilder fbb;
   const auto result = tryApplyRequest(
@@ -629,6 +645,7 @@ class BufferRequestTest : public ::testing::Test {
       copyTable(fbb, schema_, initial.data(), false);
       return fbb.Release();
     }
+    EXPECT_TRUE(verifiesAsRequest(*parsed)) << request;
     finishApplied(fbb, schema_, flatbuffers::GetAnyRoot(initial.data()),
                   flatbuffers::GetRoot<serialized::Request>(parsed->data()));
     auto result = fbb.Release();
@@ -667,6 +684,7 @@ class BufferRequestTest : public ::testing::Test {
       ADD_FAILURE() << "Failed to parse request: " << text;
       return ApplyOutcome::Refused;
     }
+    EXPECT_TRUE(verifiesAsRequest(*parsed)) << text;
     return outcomeOfRequest(initial, parsed->data());
   }
 
@@ -1315,6 +1333,43 @@ TEST_F(PayloadAlignmentTest, ReadsEveryTableOfAVectorPayload) {
     EXPECT_EQ(vector->Get(1)->i64(), 9223372036854775807) << shift;
     EXPECT_EQ(vector->Get(2)->i8(), 2) << shift;
     EXPECT_EQ(vector->Get(2)->f64(), 0.1) << shift;
+  }
+}
+
+class RequestVerifierTest : public BufferRequestTest {};
+
+// `tryApplyRequest` takes a request that passes the generated Request
+// verifier, so every request the parser writes must pass it, whatever kind
+// of payload it carries.
+TEST_F(RequestVerifierTest, VerifiesAParsedRequestOfEveryPayloadKind) {
+  const auto initial = GetBuffer("{}");
+  for (const char* request : {
+           "put i32 7",
+           R"(put string "hello")",
+           "put i32_vector [1, 2, 3]",
+           "put i32_vector[1] 5",
+           R"(put string_vector ["a", "b"])",
+           R"(put scalars {"i8": 3})",
+           "put scalars.i8 3",
+           R"(put struct_vector [{"b": true, "i8": 1, "ui8": 0, "i16": 0, )"
+           R"("ui16": 0, "i32": 0, "ui32": 0, "i64": 0, "ui64": 0, )"
+           R"("f32": 0.0, "f64": 0.0, "i32_array": [0, 0, 0, 0, 0, 0, 0, )"
+           R"(0, 0, 0]}])",
+           R"(put struct_vector[0] {"i8": 1})",
+           R"(put object {"i8": 3})",
+           R"(put object_vector [{"i8": 1}, {"i64": 9223372036854775807}])",
+           R"(put object_vector[0] {"i8": 1})",
+           R"(put number.Integer {"value": 1})",
+           R"(put number_vector[0].Fraction {"numerator": 1})",
+           R"(patch { put object {"i8": 3} ; put i8 5 ; delete i16 })",
+           R"(patch object { put number.Integer {"value": 1} })",
+           "delete i8",
+       }) {
+    const auto parsed = parseFlatbufferRequest(schema_, request);
+    ASSERT_TRUE(parsed.has_value()) << request;
+    EXPECT_TRUE(verifiesAsRequest(*parsed)) << request;
+    EXPECT_NE(outcomeOfRequest(initial, parsed->data()), ApplyOutcome::Refused)
+        << request;
   }
 }
 

@@ -103,6 +103,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   string holding a control character or text that is not UTF-8.
 
 ### Fixed
+- The generated Request verifier, `serialized::VerifyRequestBuffer`, which
+  `tryApplyRequest` takes as its precondition, refused a parsed `put` of a
+  table, a union member or an element of a vector of tables
+  (`put object {"i8": 3}`, `put number.Integer {"value": 1}`), and any patch
+  holding one. The schema declared every put's payload a flexbuffer, but
+  those payloads are flatbuffers of the table written. The payload no longer
+  carries the `flexbuffer` attribute, so the verifier checks it only as
+  bytes and every request the parser writes passes it; the apply verifies
+  each payload as the flatbuffer or flexbuffer its path calls for before
+  reading it. The binary format is unchanged, so a request serialized before
+  still applies. Code generated from the installed schema loses what the
+  attribute gave it: the C++ `Put::payload_flexbuffer_root()` accessor,
+  which misread a table payload, and the JSON form of a `payload` as a
+  flexbuffer value -- a Request written as JSON for `flatc` or the
+  FlatBuffers parser now spells it as a byte array, as it prints. Both fuzz
+  targets now check that the requests they apply pass the verifier: the
+  parse target every request it parses, and the apply target those it
+  builds from a recipe.
 - A `put` growing a vector to just under the bound on its size was reported
   `Applied` with the vector left as stored. The bound was checked against the
   builder's size before anything was built, and again by the builder after
