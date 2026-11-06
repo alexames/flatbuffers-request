@@ -48,10 +48,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned so the check does not move with the runner image. CONTRIBUTING
+      # says how to run the same version locally.
+      - name: Install clang-format
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/clang-format"
+          "$RUNNER_TEMP/clang-format/bin/pip" install --quiet clang-format==19.1.5
+          echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
       - name: Check formatting
         shell: bash
         run: |
-          find include src test fuzz \
+          clang-format --version
+          find include src test fuzz tools \
             \( -name '*.hpp' -o -name '*.cpp' -o -name '*.h' \) -print0 \
             | xargs -0 clang-format --dry-run --Werror
 

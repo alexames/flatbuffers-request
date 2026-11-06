@@ -142,10 +142,9 @@ std::optional<Offset<Vector<uint16_t>>> parseFlatbufferOffsetPath(
           // of the vector. A vector of unions has no whole-vector payload
           // anyway: the types of its elements live in a second vector that a
           // JSON array cannot carry.
-          const auto* elementDef =
-              (type->element() == reflection::Obj)
-                  ? schema->objects()->Get(type->index())
-                  : nullptr;
+          const auto* elementDef = (type->element() == reflection::Obj)
+                                       ? schema->objects()->Get(type->index())
+                                       : nullptr;
           if (writing
               and (type->element() == reflection::Union
                    or (elementDef != nullptr and elementDef->is_struct()))) {
@@ -272,10 +271,10 @@ std::optional<Offset<Put>> parseFlatbufferPut_ParsePrimitive(
   // accepted: apply reads a string as a number, which answers 0 for every
   // name, so accepting one here would write a wrong value rather than refuse
   // a wrong request.
-  if (not payloadTypeAccepts(payloadType,
-                             flexbuffers::GetRoot(
-                                 parser.flex_builder_.GetBuffer().data(),
-                                 parser.flex_builder_.GetBuffer().size()))) {
+  if (not payloadTypeAccepts(
+          payloadType,
+          flexbuffers::GetRoot(parser.flex_builder_.GetBuffer().data(),
+                               parser.flex_builder_.GetBuffer().size()))) {
     return std::nullopt;
   }
   // Advance past the parsed payload so a caller (e.g. a patch's update list)
@@ -293,9 +292,9 @@ std::optional<Offset<Put>> parseFlatbufferPut(
   const reflection::Type* type = nullptr;
   const reflection::Object* typeObject = nullptr;
   bool elementInVector = false;
-  auto offsets =
-      parseFlatbufferOffsetPath(fbb, schema, requestString, &type, &typeObject,
-                                &elementInVector, startObject, /*writing=*/true);
+  auto offsets = parseFlatbufferOffsetPath(fbb, schema, requestString, &type,
+                                           &typeObject, &elementInVector,
+                                           startObject, /*writing=*/true);
   if (not offsets) {
     return std::nullopt;
   }
@@ -327,7 +326,8 @@ std::optional<Offset<Put>> parseFlatbufferPut(
   }
   // An element's payload is one of the element type; anything else is a
   // payload of the field's own type, including a whole vector or array.
-  const auto payloadType = elementInVector ? type->element() : type->base_type();
+  const auto payloadType =
+      elementInVector ? type->element() : type->base_type();
   return parseFlatbufferPut_ParsePrimitive(fbb, requestString, *offsets,
                                            payloadType);
 }

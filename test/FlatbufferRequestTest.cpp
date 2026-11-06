@@ -98,10 +98,10 @@ class UpdateTableTest : public RequestTestBase {};
 class DeleteTableTest : public RequestTestBase {};
 class PatchTableTest : public RequestTestBase {};
 
+// clang-format off
 INSTANTIATE_TEST_SUITE_P(
     UpdateTableTest, UpdateTableTest,
     ::testing::Values(
-        // clang-format off
         // Set scalars on empty table.
         TestArgs(R"({})", "put i8   99", R"({"i8":   99})"),
         TestArgs(R"({})", "put ui8  99", R"({"ui8":  99})"),
@@ -291,31 +291,30 @@ INSTANTIATE_TEST_SUITE_P(
         TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[4].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer", "FloatingPoint"],                       "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4},{"value":9}]})"),
         TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[5].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer", "Integer", "FloatingPoint"],            "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4},{},{"value":9}]})"),
         TestArgs(R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4}]})", R"(put number_vector[6].FloatingPoint {"value":9.0})", R"({"number_vector_type": ["Integer", "Integer", "Integer", "Integer", "Integer", "Integer", "FloatingPoint"], "number_vector": [{"value":1},{"value":2},{"value":3},{"value":4},{},{},{"value":9}]})")
-        //  clang-format on
         ));
+// clang-format on
 
 TEST_P(UpdateTableTest, PutScalarInRoot) {
   const auto& args = GetParam();
   flatbuffers::FlatBufferBuilder fbb;
   auto request = parseFlatbufferRequest(schema_, args.request);
-  ASSERT_TRUE(request.has_value()) << true
-                                   << args.initial << '\n'
+  ASSERT_TRUE(request.has_value()) << true << args.initial << '\n'
                                    << args.request << '\n'
                                    << args.final;
 
   auto startingValue =
       flatbuffers::TypedBuffer(schema_, GetBuffer(args.initial));
-  fbb.Finish(applyRequest(fbb, schema_,
-                          flatbuffers::GetAnyRoot(startingValue.buffer().data()),
-                          // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
-                          flatbuffers::GetRoot<serialized::Request>(request->data())));
+  fbb.Finish(applyRequest(
+      fbb, schema_, flatbuffers::GetAnyRoot(startingValue.buffer().data()),
+      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+      flatbuffers::GetRoot<serialized::Request>(request->data())));
   auto updated = fbb.Release();
   auto expected = GetBuffer(args.final);
 
-  EXPECT_FLATBUFFERS_EQ(schema_, updated, expected) << true
-                                                    << args.initial << '\n'
-                                                    << args.request << '\n'
-                                                    << args.final;
+  EXPECT_FLATBUFFERS_EQ(schema_, updated, expected)
+      << true << args.initial << '\n'
+      << args.request << '\n'
+      << args.final;
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -718,8 +717,8 @@ TEST_F(RefusedPutTest, RefusesAWholeVectorOfUnions) {
 class NestedStructTest : public BufferRequestTest {};
 
 TEST_F(NestedStructTest, PutsAMemberOfAStructInsideAStruct) {
-  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
-                               "put nested.inner.a 3");
+  auto result =
+      applyRequestTo(GetBuffer(R"({"i32": 10})"), "put nested.inner.a 3");
   const auto* ts = matcher_test::GetTestSchema(result.data());
   ASSERT_NE(ts->nested(), nullptr);
   EXPECT_EQ(ts->nested()->inner().a(), 3);
@@ -727,8 +726,8 @@ TEST_F(NestedStructTest, PutsAMemberOfAStructInsideAStruct) {
 }
 
 TEST_F(NestedStructTest, PutsAnArrayElementInsideANestedStruct) {
-  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
-                               "put nested.inner.arr[1] 55");
+  auto result =
+      applyRequestTo(GetBuffer(R"({"i32": 10})"), "put nested.inner.arr[1] 55");
   const auto* ts = matcher_test::GetTestSchema(result.data());
   ASSERT_NE(ts->nested(), nullptr);
   EXPECT_EQ(ts->nested()->inner().arr()->Get(1), 55);
@@ -736,9 +735,8 @@ TEST_F(NestedStructTest, PutsAnArrayElementInsideANestedStruct) {
 }
 
 TEST_F(NestedStructTest, PutsAMemberAfterANestedStructWithoutDisturbingIt) {
-  auto result = applyRequestTo(
-      GetBuffer(R"({"i32": 10})"),
-      R"(put nested {"inner": {"a": 4}, "tail": 77})");
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                               R"(put nested {"inner": {"a": 4}, "tail": 77})");
   const auto* ts = matcher_test::GetTestSchema(result.data());
   ASSERT_NE(ts->nested(), nullptr);
   EXPECT_EQ(ts->nested()->inner().a(), 4);
@@ -777,8 +775,9 @@ TEST_F(NestedStructTest, LeavesAnAbsentStructAbsentWhenNothingIsWritten) {
 }
 
 TEST_F(NestedStructTest, LeavesAnAbsentStructAbsentWhenAnArrayIsTooLong) {
-  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
-                               "put scalars.i32_array [1,2,3,4,5,6,7,8,9,10,11]");
+  auto result =
+      applyRequestTo(GetBuffer(R"({"i32": 10})"),
+                     "put scalars.i32_array [1,2,3,4,5,6,7,8,9,10,11]");
   const auto* ts = matcher_test::GetTestSchema(result.data());
   EXPECT_EQ(ts->scalars(), nullptr);
   EXPECT_EQ(ts->i32(), 10);
@@ -788,8 +787,8 @@ TEST_F(StructPutTest, LeavesAnAbsentStructAbsentWhenTheMapNamesNoMember) {
   // The payload named nothing the struct declares, so nothing was written --
   // and a request that writes nothing must not leave a struct of zeroes where
   // the buffer had none.
-  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"),
-                               R"(put scalars {"zzz": 1})");
+  auto result =
+      applyRequestTo(GetBuffer(R"({"i32": 10})"), R"(put scalars {"zzz": 1})");
   const auto* ts = matcher_test::GetTestSchema(result.data());
   EXPECT_EQ(ts->scalars(), nullptr);
   EXPECT_EQ(ts->i32(), 10);
@@ -807,8 +806,7 @@ TEST_F(StructPutTest, LeavesAStoredStructAloneWhenTheMapNamesNoMember) {
 TEST_F(StructPutTest, LeavesAnAbsentStructAbsentForAnEmptyMap) {
   // An empty map names no member either, so it writes nothing by the same
   // rule. Creating a struct of zeroes for one would be the same surprise.
-  auto result =
-      applyRequestTo(GetBuffer(R"({"i32": 10})"), "put scalars {}");
+  auto result = applyRequestTo(GetBuffer(R"({"i32": 10})"), "put scalars {}");
   const auto* ts = matcher_test::GetTestSchema(result.data());
   EXPECT_EQ(ts->scalars(), nullptr);
 }
@@ -817,8 +815,7 @@ TEST_F(StructPutTest, WritesTheMembersAMapDoesNameBesideOnesItDoesNot) {
   // One known key is enough: the unknown ones are still ignored rather than
   // refusing the whole request.
   auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
-  auto result =
-      applyRequestTo(initial, R"(put scalars {"zzz": 1, "i16": 40})");
+  auto result = applyRequestTo(initial, R"(put scalars {"zzz": 1, "i16": 40})");
   const auto* ts = matcher_test::GetTestSchema(result.data());
   ASSERT_NE(ts->scalars(), nullptr);
   EXPECT_EQ(ts->scalars()->i16(), 40);
@@ -870,10 +867,9 @@ TEST_F(StructPutTest, LeavesAStoredArrayAloneForAnEmptyArrayPayload) {
 // wrong request.
 TEST_F(StructPutTest, RefusesAWrongKindValueForAScalarMemberInAMap) {
   auto initial = GetBuffer(std::string(R"({"scalars": )") + kStructB + "}");
-  for (const auto* request : {R"(put scalars {"i8": [1,2,3]})",
-                              R"(put scalars {"i8": "hello"})",
-                              R"(put scalars {"i8": "7"})",
-                              R"(put scalars {"i8": {"q": 1}})"}) {
+  for (const auto* request :
+       {R"(put scalars {"i8": [1,2,3]})", R"(put scalars {"i8": "hello"})",
+        R"(put scalars {"i8": "7"})", R"(put scalars {"i8": {"q": 1}})"}) {
     auto result = applyRequestTo(initial, request);
     const auto* ts = matcher_test::GetTestSchema(result.data());
     ASSERT_NE(ts->scalars(), nullptr) << request;

@@ -34,7 +34,25 @@ a one-line `TestArgs(...)`.
 
 ## Style
 
-- Format with `clang-format` (`.clang-format` is checked in) before committing.
+- Format with `clang-format` 19.1.5 (`.clang-format` is checked in) before
+  committing. CI pins that version, because formatting differs between
+  releases; get the same one from PyPI rather than relying on whichever
+  `clang-format` a toolchain bundles (Visual Studio's bundled copy changes
+  with Visual Studio updates). From a POSIX shell (Git Bash on Windows):
+
+  ```bash
+  python -m venv ~/.venvs/clang-format-19
+  ~/.venvs/clang-format-19/bin/pip install clang-format==19.1.5
+  find include src test fuzz tools \
+    \( -name '*.hpp' -o -name '*.cpp' -o -name '*.h' \) -print0 \
+    | xargs -0 ~/.venvs/clang-format-19/bin/clang-format --dry-run --Werror
+  ```
+
+  On Windows the venv's executables are under `Scripts\` rather than `bin/`.
+  `pipx run --spec clang-format==19.1.5 clang-format <args>` runs the same
+  version without a venv.
+
+  Pass `-i` instead of `--dry-run --Werror` to reformat in place.
 - Fix `clang-tidy` warnings (`.clang-tidy` is checked in).
 - Keep to ASCII in source files.
 - Follow the surrounding code's naming and comment density.

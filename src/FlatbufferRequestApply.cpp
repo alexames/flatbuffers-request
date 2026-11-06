@@ -272,9 +272,8 @@ static StructWrite writeStructMap(const reflection::Schema* schema,
       continue;
     }
     const auto memberOffset = fieldDef->offset();
-    const auto written = writeStructMember(schema, structDef, image,
-                                           std::span{&memberOffset, 1},
-                                           values[i]);
+    const auto written = writeStructMember(
+        schema, structDef, image, std::span{&memberOffset, 1}, values[i]);
     if (written == StructWrite::Rejected) {
       return StructWrite::Rejected;
     }
@@ -307,8 +306,8 @@ static StructWrite writeStructMember(const reflection::Schema* schema,
 
   if (baseType == reflection::Obj) {
     const auto* nested = schema->objects()->Get(fieldDef->type()->index());
-    return writeStructMember(schema, nested, at.first(nested->bytesize()),
-                             rest, value);
+    return writeStructMember(schema, nested, at.first(nested->bytesize()), rest,
+                             value);
   }
   if (baseType == reflection::Array) {
     const auto elementType = fieldDef->type()->element();
