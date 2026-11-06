@@ -19,6 +19,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   debug build on a `vector64`, and looks a union member up by its position
   among the union's values rather than its value. The `fbrequest` tool
   verifies its input with it.
+- An apply fuzz target, `fbrequest_fuzz_apply`, which applies hand-built
+  requests, both raw bytes that pass the Request verifier and requests built
+  from the test schema's field offsets, member values and payloads, to buffers
+  of that schema, in a builder that may already hold data. It checks that an
+  apply does not crash, that an `Applied` result verifies, and that any other
+  builds nothing; not that an `Applied` one made its edit. CI runs it beside
+  the parse target.
 - Puts and patches on a vector of structs, which were refused. Each rebuilds
   the vector at its struct's alignment, or what `force_align` asks, and
   copies the rest of the table as any edit does:
