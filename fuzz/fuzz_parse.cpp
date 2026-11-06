@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "fbrequest/FlatbufferRequest.hpp"
+#include "fbrequest/FlatbufferRequest_generated.h"
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/idl.h"
 #include "flatbuffers/reflection.h"
@@ -71,7 +72,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     flatbuffers::FlatBufferBuilder fbb;
     fbb.Finish(fbrequest::applyRequest(
         fbb, schema, flatbuffers::GetAnyRoot(emptyRoot().data()),
-        parsed->get()));
+        flatbuffers::GetRoot<serialized::Request>(parsed->data())));
   }
   return 0;
 }
